@@ -1,0 +1,172 @@
+{
+  "noise_3s": {
+    "name": "noise_3s",
+    "enc_shape": [
+      1,
+      1024,
+      39
+    ],
+    "enc_len": 39,
+    "text": "",
+    "y_sequence": [],
+    "n_tokens": 0,
+    "score": 0.0
+  },
+  "noise_loud_3s": {
+    "name": "noise_loud_3s",
+    "enc_shape": [
+      1,
+      1024,
+      39
+    ],
+    "enc_len": 39,
+    "text": "",
+    "y_sequence": [],
+    "n_tokens": 0,
+    "score": 0.0
+  },
+  "quiet_1s": {
+    "name": "quiet_1s",
+    "enc_shape": [
+      1,
+      1024,
+      14
+    ],
+    "enc_len": 14,
+    "text": "",
+    "y_sequence": [],
+    "n_tokens": 0,
+    "score": 0.0
+  },
+  "real_0": {
+    "enc_shape": [
+      1,
+      1024,
+      44
+    ],
+    "enc_len": 44,
+    "n_tokens": 20,
+    "text": "This is Samantha Lee with a night to remember.",
+    "y_sequence": [
+      69,
+      15,
+      57,
+      67,
+      88,
+      27,
+      100,
+      945,
+      181,
+      606,
+      7,
+      87,
+      3,
+      43,
+      115,
+      22,
+      428,
+      198,
+      280,
+      962
+    ],
+    "ref": "This is Samantha Lee with a night to"
+  },
+  "real_1": {
+    "enc_shape": [
+      1,
+      1024,
+      41
+    ],
+    "enc_len": 41,
+    "n_tokens": 12,
+    "text": "How much juice is in one lime?",
+    "y_sequence": [
+      596,
+      23,
+      320,
+      128,
+      953,
+      284,
+      57,
+      35,
+      175,
+      36,
+      777,
+      977
+    ],
+    "ref": "How much juice is in one lime?"
+  },
+  "real_2": {
+    "enc_shape": [
+      1,
+      1024,
+      162
+    ],
+    "enc_len": 162,
+    "n_tokens": 74,
+    "text": "Please provide a detailed comparison of the pros and cons of solar panel installation for a home, including initial cost, long term savings, maintenance, and potential environmental benefits.",
+    "y_sequence": [
+      172,
+      51,
+      342,
+      147,
+      964,
+      234,
+      3,
+      729,
+      469,
+      31,
+      151,
+      866,
+      15,
+      18,
+      29,
+      5,
+      147,
+      948,
+      33,
+      138,
+      948,
+      29,
+      743,
+      37,
+      25,
+      27,
+      196,
+      35,
+      81,
+      84,
+      11,
+      47,
+      75,
+      3,
+      16,
+      122,
+      961,
+      35,
+      616,
+      20,
+      35,
+      14,
+      401,
+      239,
+      81,
+      961,
+      36,
+      251,
+      1,
+      443,
+      231,
+      964,
+      260,
+      961,
+      23,
+      133,
+      706,
+      324,
+      961,
+      33
+    ],
+    "ref": "Please provide a detailed comparison of the pros and cons of solar panel installation for a home including initial cost long-term savings maintenance and potential environmental benefits"
+  }
+}

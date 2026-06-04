@@ -1,0 +1,64 @@
+# Model weights / HF cache (download separately; see README)
+models/
+.cache/
+*.gguf
+
+# Compiled inference artifacts — large + GPU-arch-specific; regenerate per runtime/ARTIFACTS.md.
+# (runtime/fixtures/*.pt are small decode fixtures and ARE committed — note *.pt is not ignored.)
+*.pt2
+*.ts
+runtime/artifacts/
+runtime/artifacts_*/
+runtime/steady_b_artifacts/
+runtime/steady_b_artifacts_*/
+
+# C/C++ build trees
+build/
+cpp/build/
+cpp/build_*/
+runtime/cpp/build/
+runtime/cpp/build_*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# EC2 provisioning state + private keys (NEVER commit)
+ec2-bench/.instance*.json
+*.pem
+*.key
+
+# Generated test fixtures (only harvard_16k.wav + test_manifest.json are committed)
+tests/fixtures/output/
+tests/fixtures/test_speech.wav
+tests/fixtures/sample.flac
+
+# Benchmark / run outputs
+*_results.json
+*.srvlog
+*.records
+*.log
+*.tmp
+
+# IDE / editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/

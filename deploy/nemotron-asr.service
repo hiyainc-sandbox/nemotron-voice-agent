@@ -1,0 +1,68 @@
+# Nemotron ASR single-process systemd unit.
+#
+# Purpose:
+#   Run deploy/launch_single.sh as the one Nemotron streaming-ASR process on an
+#   L40S host. systemd is the sole supervisor: the launcher execs Python and
+#   does not run its own restart loop.
+#
+# Install:
+#   sudo cp deploy/nemotron-asr.service /etc/systemd/system/nemotron-asr.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nemotron-asr
+#
+# Logs:
+#   journalctl -u nemotron-asr -f
+#
+# Environment overrides:
+#   Optional per-box overrides live in /etc/nemotron/asr.env. Start from
+#   deploy/asr.env.example, use absolute paths there, then run:
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart nemotron-asr
+#
+# SIGTERM / drain:
+#   SIGTERM is a process kill. TimeoutStopSec=120 is only a backstop for a stuck
+#   stop; it is not a graceful WebSocket drain mechanism. A direct
+#   "systemctl restart nemotron-asr" cuts active streams. Operators MUST drain
+#   first via deploy/drain.sh, wait for active streams to empty, and only then
+#   restart or stop this unit.
+#
+# Health gate:
+#   systemd starts the process. The load balancer /health check gates traffic
+#   after model load; the unit intentionally does not poll readiness itself.
+#
+# Related docs:
+#   Launcher: deploy/launch_single.sh
+#   Runbook/how: deploy/RUNBOOK.md
+#   Rationale/why: deploy/DEPLOYMENT.md
+
+[Unit]
+Description=Nemotron streaming ASR single-process server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nemotron
+
+# Inline defaults keep the unit bootable without /etc/nemotron/asr.env.
+# Hardcoded /home/ubuntu — systemd %h resolves to /root for system-mode units
+# regardless of User=ubuntu (per `man systemd.unit`: "In case of the system
+# manager this resolves to /root"). Live-validation 2026-05-28 caught this:
+# %h-based units fail with 203/EXEC because the launcher path resolves to
+# /root/nemotron/... If you must run as a different user, edit these paths.
+Environment=HF_HOME=/home/ubuntu/hf NEMOTRON_VENV=/home/ubuntu/nemo-venv NEMOTRON_APP_DIR=/home/ubuntu/nemotron NEMOTRON_ADMISSION_MAX_BACKLOG=12
+
+# Optional operator overrides. The leading "-" tolerates a missing file.
+EnvironmentFile=-/etc/nemotron/asr.env
+
+ExecStart=/home/ubuntu/nemotron/deploy/launch_single.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

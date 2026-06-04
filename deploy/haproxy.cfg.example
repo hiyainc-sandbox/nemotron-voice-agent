@@ -1,0 +1,48 @@
+# HAProxy routing — DESIGN ARTIFACT for Step 3 of proj-2026-05-21-inference-opt/PLAN.md.
+#
+# Routes WebSocket ASR streams across the K server processes (and across boxes) by LEAST-CONNECTIONS,
+# capping each process at the measured in-budget point (L40S: ~7 concurrent; L4: ~3-4), with
+# health-checks + connection draining.
+#
+# WHY this works with no custom code: 1 WS connection = 1 stream = 1 unit of capacity, so connection-count
+# routing IS stream-count routing. WS streams are stateful + sticky-for-life (the LB picks a process at connect;
+# the stream stays there until close — no mid-stream rebalance). A custom proxy is only needed if you later want
+# lag-aware routing (route on measured processing-lag instead of connection count).
+
+global
+    maxconn 100000
+    log stdout format raw local0
+
+defaults
+    mode    http
+    log     global
+    option  httplog
+    timeout connect 5s
+    timeout client  1h          # long-lived WebSocket streams
+    timeout server  1h
+    option  httpchk GET /health  # server.py readiness endpoint (model loaded + warmed)
+
+frontend asr_ws
+    bind *:8443
+    # (TLS terminates here in prod: `bind *:8443 ssl crt /etc/ssl/asr.pem`)
+    default_backend asr_pool
+
+backend asr_pool
+    balance leastconn                    # fewest active conns => furthest below the per-process budget
+    # One line per (box, process-port). maxconn caps each process at the latency-safe operating point.
+    # Use maxconn 7 for L40S; use maxconn 3-4 for L4 depending on the target SLO margin.
+    # Generate these from the per-GPU matrix (K ports/box) x the fleet (autoscaling group / ECS tasks).
+    server box1_p0 10.0.1.10:8080 check maxconn 7
+    server box1_p1 10.0.1.10:8081 check maxconn 7
+    server box1_p2 10.0.1.10:8082 check maxconn 7   # L4: 2 ports/box; L40S: 3 ports/box today
+    server box2_p0 10.0.1.11:8080 check maxconn 7
+    server box2_p1 10.0.1.11:8081 check maxconn 7
+    # ...
+
+# DRAIN before deploy/kill (let in-flight streams finish): runtime API / socket ->
+#   `set server asr_pool/box1_p0 state drain`   then wait for sessions to drain, then DOWN, then redeploy.
+#
+# AWS-NATIVE EQUIVALENT (ALB): an Application Load Balancer with WebSocket support + "least outstanding
+# requests" routing, target group = the K process-ports across the autoscaled instances, deregistration delay
+# = the drain. Same shape; managed instead of self-hosted HAProxy. (Per-target max-conn is less direct on ALB
+# than HAProxy `maxconn`; enforce the cap app-side or via target-group sizing.)

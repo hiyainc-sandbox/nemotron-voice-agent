@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Nemotron streaming ASR — per-chunk inference flow</title>
+<style>
+  :root{--client:#2563eb;--server:#0f766e;--nemo:#7c3aed;--state:#b45309;
+        --danger:#b91c1c;--fix:#15803d;--bg:#0b1020;--card:#141a2e;--ink:#e5e7eb;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}
+  header{padding:20px 28px;border-bottom:1px solid #243049}
+  h1{margin:0 0 4px;font-size:20px}
+  header p{margin:0;color:#9aa4bf}
+  .wrap{display:flex;gap:24px;padding:24px 28px;align-items:flex-start;flex-wrap:wrap}
+  .col{flex:1 1 520px;min-width:420px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;margin:0 28px 8px;font-size:12px}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
+  h2{font-size:15px;color:#cbd5e1;border-left:3px solid #334155;padding-left:8px;margin:4px 0 14px}
+  .node{background:var(--card);border:1px solid #283350;border-left-width:5px;
+        border-radius:8px;padding:10px 13px;margin:0 0 6px;position:relative}
+  .node .fn{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:#fff}
+  .node .ref{float:right;color:#7e8aa8;font-size:11px;font-family:ui-monospace,monospace}
+  .node .desc{margin-top:5px;color:#c3cbe0;font-size:12.5px}
+  .node .st{margin-top:6px;font-size:11.5px;color:#d6a256}
+  .node .st b{color:#f0b965}
+  .c-client{border-left-color:var(--client)}
+  .c-server{border-left-color:var(--server)}
+  .c-nemo{border-left-color:var(--nemo)}
+  .c-state{border-left-color:var(--state)}
+  .c-danger{border-left-color:var(--danger);background:#2a1414}
+  .c-fix{border-left-color:var(--fix);background:#0f2417}
+  .arrow{text-align:center;color:#64748b;font-size:16px;margin:-1px 0 4px}
+  .loop{border:1px dashed #3b4a6b;border-radius:8px;padding:8px;margin:0 0 6px}
+  .loop>.lbl{font-size:11px;color:#8aa0c8;margin:0 0 6px;text-transform:uppercase;letter-spacing:.05em}
+  .nemo-box{border:1px dashed #5b3fa0;border-radius:8px;padding:8px;background:#16112b}
+  .nemo-box>.lbl{font-size:11px;color:#a78bfa;margin:0 0 6px}
+  .note{background:#101a14;border:1px solid #234;border-left:4px solid var(--fix);
+        border-radius:8px;padding:12px 14px;margin:14px 28px;color:#cfe7d8;font-size:13px}
+  .note b{color:#7ee2a8}
+  table{border-collapse:collapse;width:calc(100% - 56px);margin:8px 28px 24px;font-size:12.5px}
+  th,td{border:1px solid #283350;padding:6px 9px;text-align:left}
+  th{background:#16203a;color:#cbd5e1}
+  td:first-child{font-family:ui-monospace,monospace;color:#fff;white-space:nowrap}
+  code{background:#1c2742;padding:1px 5px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Nemotron streaming ASR — what happens per chunk of audio</h1>
+  <p>Server: <code>src/nemotron_speech/server.py</code> · model: cache-aware FastConformer-RNNT
+     (<code>nvidia/nemotron-speech-streaming-en-0.6b</code>, greedy) · annotated against verified line numbers.</p>
+</header>
+
+<div class="legend">
+  <span><i class="dot" style="background:#2563eb"></i>client / WS protocol</span>
+  <span><i class="dot" style="background:#0f766e"></i>server orchestration</span>
+  <span><i class="dot" style="background:#7c3aed"></i>NeMo inference</span>
+  <span><i class="dot" style="background:#b45309"></i>session state read/mutated</span>
+  <span><i class="dot" style="background:#b91c1c"></i>cold reset — the WER damage</span>
+  <span><i class="dot" style="background:#15803d"></i>proposed fork point (fix)</span>
+</div>
+
+<div class="wrap">
+
+  <!-- ============ STREAMING PATH ============ -->
+  <div class="col">
+    <h2>A. Streaming path — every audio chunk (emits interim)</h2>
+
+    <div class="node c-client">
+      <span class="ref">client</span>
+      <div class="fn">run_stt(audio) → ws.send(pcm bytes)</div>
+      <div class="desc">Pipecat base <code>STTService.process_audio_frame</code> forwards every
+        <code>InputAudioRawFrame</code> (20 ms, 16 kHz, s16le) to the WebSocket as it arrives.</div>
+    </div>
+    <div class="arrow">▼</div>
+
+    <div class="node c-server">
+      <span class="ref">server.py:305 / :368</span>
+      <div class="fn">websocket_handler → _handle_audio(session, audio_bytes)</div>
+      <div class="desc">Binary frame routed to <code>_handle_audio</code>.
+        <code>int16 → float32/32768</code>, then appended to the rolling buffer.</div>
+      <div class="st">writes <b>session.accumulated_audio</b> = concat(accumulated, new) <span style="color:#7e8aa8">(:376)</span></div>
+    </div>
+    <div class="arrow">▼</div>
+
+    <div class="loop">
+      <div class="lbl">while accumulated_audio ≥ min_audio_for_chunk &nbsp;
+        <span style="color:#9aa4bf;text-transform:none">min = (emitted_frames + shift_frames + 1) × hop_samples &nbsp;(:380)</span></div>
+
+      <div class="node c-server">
+        <span class="ref">server.py:382-386</span>
+        <div class="fn">async with inference_lock: run_in_executor(_process_chunk)</div>
+        <div class="desc">One chunk processed at a time (global inference lock), off the event loop.</div>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="node c-server">
+        <span class="ref">server.py:412</span>
+        <div class="fn">model.preprocessor(input_signal = ALL accumulated_audio)</div>
+        <div class="desc">Re-computes the <b>full</b> log-mel for the entire accumulated buffer every step
+          (not incremental). dither = 0 → deterministic.</div>
+        <div class="st">→ <b>mel</b> [1, 80, T]</div>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="node c-server">
+        <span class="ref">server.py:422-438</span>
+        <div class="fn">select this chunk's mel frames</div>
+        <div class="desc">
+          <code>available = mel.shape[-1] − 1</code> (drop unstable last edge frame).
+          If <code>available − emitted_frames &lt; shift_frames</code> → return (not enough).<br>
+          • first chunk: <code>mel[:, :, 0 : shift_frames]</code>, drop_extra = 0<br>
+          • later chunks: <code>mel[:, :, emitted_frames − pre_encode_cache_size : emitted_frames + shift_frames]</code>,
+            drop_extra = <code>scfg.drop_extra_pre_encoded</code></div>
+        <div class="st">reads <b>emitted_frames</b>; shift_frames=16 (160 ms), pre_encode_cache=9 (90 ms)</div>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="nemo-box">
+        <div class="lbl">▼ model.conformer_stream_step(keep_all_outputs=False) &nbsp;— server.py:451-462</div>
+
+        <div class="node c-nemo">
+          <div class="fn">pre-encode (conv subsampling) → drop_extra_pre_encoded</div>
+          <div class="desc">Downsamples the chunk mel; discards the extra pre-encoded frames that exist
+            only because we prepended <code>pre_encode_cache_size</code> lookback (so non-first chunks
+            align to the same stride as the first).</div>
+        </div>
+        <div class="arrow">▼</div>
+        <div class="node c-nemo">
+          <div class="fn">cache-aware Conformer encoder forward</div>
+          <div class="desc">Limited-context attention + depthwise conv, using the rolling caches as
+            left/conv context. Attention window = <code>att_context_size = [70, R]</code>
+            (left = 70 frames; right = R = lookahead, set at load).</div>
+          <div class="st">reads+writes <b>cache_last_channel</b> (attention/channel state, ≈70-frame left window),
+            <b>cache_last_time</b> (conv state), <b>cache_last_channel_len</b></div>
+        </div>
+        <div class="arrow">▼</div>
+        <div class="node c-nemo">
+          <div class="fn">RNNT greedy decode (joint + prediction net)</div>
+          <div class="desc">Continues decoding from the prior hypothesis/prediction state (no restart) →
+            cumulative transcript so far.</div>
+          <div class="st">reads+writes <b>previous_hypotheses</b>, <b>pred_out_stream</b> → returns
+            <b>transcribed_texts</b></div>
+        </div>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="node c-state">
+        <span class="ref">server.py:445-465</span>
+        <div class="fn">commit returned state</div>
+        <div class="desc">All six rolling values are reassigned from the call's return tuple;
+          frame cursor advances by one shift.</div>
+        <div class="st">writes <b>pred_out_stream, cache_last_channel/time/len, previous_hypotheses</b>;
+          <b>emitted_frames += shift_frames</b> (:465)</div>
+      </div>
+      <div class="arrow">▼</div>
+
+      <div class="node c-server">
+        <span class="ref">server.py:388-395</span>
+        <div class="fn">if text changed → ws.send {type:transcript, is_final:false}</div>
+        <div class="desc">Interim. Client pushes <code>InterimTranscriptionFrame</code> — the benchmark
+          collector <b>ignores</b> these. Loop: recompute min, repeat while buffer has another chunk.</div>
+        <div class="st">writes <b>session.current_text</b></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ FINALIZE PATH ============ -->
+  <div class="col">
+    <h2>B. Finalize path — on a reset message (emits the one real transcript)</h2>
+
+    <div class="node c-client">
+      <span class="ref">client</span>
+      <div class="fn">on VADUserStoppedSpeakingFrame → ws.send {type:reset, finalize:true}</div>
+      <div class="desc"><b>Today:</b> the client hard-finalizes on <em>every</em> VAD stop. (Proposed:
+        send <code>{type:"vad_stop"}</code> and let the server speculate — col-spanning note below.)</div>
+    </div>
+    <div class="arrow">▼</div>
+
+    <div class="node c-server">
+      <span class="ref">server.py:339 / :485</span>
+      <div class="fn">websocket_handler → _reset_session(session, finalize=True)</div>
+      <div class="desc"><code>finalize=false</code> = <b>soft</b> (:518-535): return <code>current_text</code>,
+        <em>no inference, no state reset</em> — lossless, unused by our client.
+        <code>finalize=true</code> = <b>hard</b> (below).</div>
+    </div>
+    <div class="arrow">▼</div>
+
+    <div class="node c-server">
+      <span class="ref">server.py:541-546</span>
+      <div class="fn">pad accumulated_audio with silence</div>
+      <div class="desc">Append <code>(R + 1) × shift_frames</code> frames of zeros so the cache-aware
+        encoder has enough <b>right</b> context to flush the last real frame
+        (R=1 → 2×16 = 32 frames = <b>320 ms</b>).</div>
+      <div class="st">writes <b>accumulated_audio</b> += silence</div>
+    </div>
+    <div class="arrow">▼</div>
+
+    <div class="nemo-box">
+      <div class="lbl">▼ _process_final_chunk → conformer_stream_step(keep_all_outputs=True) — server.py:609 / :657-668</div>
+      <div class="node c-nemo">
+        <div class="fn">same encoder + RNNT path, but emit ALL remaining frames</div>
+        <div class="desc"><code>chunk_mel = mel[:, :, chunk_start:]</code> (all remaining incl. edge);
+          <code>keep_all_outputs=True</code> forces the decoder to flush trailing tokens
+          (this advances the caches/decoder with the silence — why you cannot cleanly
+          continue from a finalized context).</div>
+        <div class="st">reads+writes the same six rolling values → <b>final_text</b></div>
+      </div>
+    </div>
+    <div class="arrow">▼</div>
+
+    <div class="node c-server">
+      <span class="ref">server.py:562-584</span>
+      <div class="fn">delta dedup → ws.send {type:transcript, is_final:true, finalize:true}</div>
+      <div class="desc">If <code>final_text.startswith(last_emitted_text)</code> →
+        send only <code>final_text[len(last_emitted_text):].lstrip()</code>; else send full.
+        Client pushes <b>one</b> <code>TranscriptionFrame</code>.</div>
+      <div class="st">reads/writes <b>last_emitted_text</b></div>
+    </div>
+    <div class="arrow">▼</div>
+
+    <div class="node c-danger">
+      <span class="ref">server.py:591-603 → _init_session :260</span>
+      <div class="fn">_init_session(session) — COLD RESET ⚠</div>
+      <div class="desc"><b>This is the WER damage.</b> Fired on <em>every</em> VAD stop, so a
+        paused utterance is chopped into independently cold-restarted, concatenated
+        fragments (3.08% vs ~1.3% single-finalize).</div>
+      <div class="st">resets <b>cache_last_channel/time/len = get_initial_cache_state()</b> (zeros),
+        <b>previous_hypotheses=None, pred_out_stream=None, emitted_frames=0,
+        accumulated_audio=[], last_emitted_text=""</b></div>
+    </div>
+    <div class="arrow">▼</div>
+
+    <div class="node c-fix">
+      <span class="ref">proposed</span>
+      <div class="fn">FIX: never cold-reset mid-utterance</div>
+      <div class="desc">Keep one continuous never-finalized context; on a (server-side) speculative
+        finalize, <b>fork a deep copy</b> of the six rolling values + accumulated_audio,
+        run the padded <code>keep_all_outputs</code> flush <em>on the fork</em>, and
+        discard it if speech resumes within the debounce window. The live context is
+        never touched → reproduces the ~1.3% continuous regime.</div>
+    </div>
+  </div>
+
+</div>
+
+<div class="note">
+  <b>Right context (NVIDIA "configurable lookahead"):</b> one knob —
+  <code>att_context_size = [70, R]</code> set at load via
+  <code>encoder.set_default_att_context_size([70, R])</code>. R is the number of future
+  chunks each conformer layer may attend to; the multi-context-trained checkpoint supports
+  R ∈ {0, 1, 6, 13} → ≈ {80, 160, 560, 1120} ms latency (we run R=1). The silence padding at
+  finalize is <em>not</em> a separate setting — it is mechanically <code>(R+1)×shift_frames</code>,
+  the trailing frames the encoder must see to flush the last real frame at that R.
+</div>
+
+<table>
+  <tr><th>Session state</th><th>Meaning</th><th>Per streaming chunk</th><th>On hard reset</th></tr>
+  <tr><td>cache_last_channel</td><td>Conformer attention/channel cache (~70-frame left window)</td><td>read+rewritten</td><td><b>zeroed</b> (cold)</td></tr>
+  <tr><td>cache_last_time</td><td>Depthwise-conv cache</td><td>read+rewritten</td><td><b>zeroed</b></td></tr>
+  <tr><td>cache_last_channel_len</td><td>Valid cache length</td><td>read+rewritten</td><td><b>reset</b></td></tr>
+  <tr><td>previous_hypotheses</td><td>RNNT running hypotheses</td><td>carried forward</td><td><b>None</b></td></tr>
+  <tr><td>pred_out_stream</td><td>RNNT prediction-net state</td><td>carried forward</td><td><b>None</b></td></tr>
+  <tr><td>emitted_frames</td><td>Frame cursor (drives chunk slice + drop_extra)</td><td>+= 16</td><td><b>0</b></td></tr>
+  <tr><td>accumulated_audio</td><td>Full raw buffer (re-mel'd each step)</td><td>+= new audio</td><td><b>[]</b></td></tr>
+  <tr><td>current_text / last_emitted_text</td><td>Cumulative text / dedup anchor</td><td>updated</td><td>last_emitted → ""</td></tr>
+</table>
+
+</body>
+</html>

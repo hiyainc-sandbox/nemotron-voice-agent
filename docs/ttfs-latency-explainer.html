@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nemotron Streaming ASR — Finalization Latency (TTFS) Explainer</title>
+<style>
+  body{font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;max-width:920px;margin:2rem auto;padding:0 1.2rem}
+  h1{font-size:1.5rem;border-bottom:2px solid #333;padding-bottom:.3rem}
+  h2{font-size:1.15rem;margin-top:1.8rem;border-bottom:1px solid #ccc;padding-bottom:.2rem}
+  table{border-collapse:collapse;width:100%;margin:.8rem 0;font-size:14px}
+  th,td{border:1px solid #bbb;padding:.4rem .55rem;text-align:left;vertical-align:top}
+  th{background:#f0f0f0}
+  code{background:#f4f4f4;padding:.1rem .3rem;border-radius:3px;font-size:13px}
+  .m{color:#0a7d28;font-weight:600}/*measured*/
+  .o{color:#b06000;font-weight:600}/*modeled*/
+  .r{color:#7a3ea8;font-weight:600}/*reasoned*/
+  .key{background:#fffbea;border-left:4px solid #e0b400;padding:.6rem .9rem;margin:1rem 0}
+  .floor{background:#eaf4ff;border-left:4px solid #2b78d4;padding:.6rem .9rem;margin:1rem 0}
+  small{color:#666}
+</style>
+</head>
+<body>
+
+<h1>Finalization Latency (TTFS): bounds, factors, and where the wins are</h1>
+<p>Scope: the <code>fork</code> configuration (Step 7d) — server-side continuous context + short
+debounce + speculative disposable fork. Legend: <span class="m">measured</span> ·
+<span class="o">modeled</span> · <span class="r">reasoned (pending confirmation)</span>.
+<small>(Revised per the Codex technical-accuracy review: §3 floor recast as a modeled-formula
+floor, not irreducible; §6 blank/entropy downgraded to "requires enabling supported decode
+instrumentation"; flush/transport wording fixed; discard-safety clarified as pre-emit only.)</small></p>
+
+<h2>1. Two reference frames (they measure different start points)</h2>
+<table>
+<tr><th>Frame</th><th>What it measures</th><th>p95</th></tr>
+<tr><td><b>Budget formula</b> (the locked-Rule gate metric)</td>
+<td><code>endpoint_wait + rc1 + finalize_flush + transport</code>, measured <i>from <code>vad_stop</code></i>
+— the first three/last are <span class="m">measured</span> except <span class="o">rc1, a modeled constant</span></td>
+<td>~326 ms (preliminary, n≈499/1000) → PASS &lt; 400 ms</td></tr>
+<tr><td><b>Perceived</b> latency (from true acoustic end-of-speech)</td>
+<td>adds the Silero VAD endpoint window (<code>stop_secs</code> ≈ 200 ms) <i>before</i> <code>vad_stop</code></td>
+<td class="r">~360–375 ms (reasoned; run-end observer-TTFS will confirm)</td></tr>
+</table>
+<p class="key"><b>Key clarification.</b> The budget number starts the clock at <code>vad_stop</code>.
+The Silero VAD must first observe ~200&nbsp;ms of trailing silence to <i>emit</i> <code>vad_stop</code>
+(Pipecat <code>VADUserStoppedSpeakingFrame</code>, <code>stop_secs=0.2</code>); the 150&nbsp;ms
+server debounce is serial <i>after</i> that. <code>measure.py</code> defines
+<code>endpoint_wait = debounce_expiry − vad_stop</code>, so the Silero 200&nbsp;ms is
+<b>excluded</b> from that measured term (the observer-TTFS metric likewise subtracts
+<code>stop_secs</code>). The two waits stack (~200&nbsp;ms VAD + 150&nbsp;ms debounce). The
+<span class="o">rc1</span> 160&nbsp;ms right-context <b>overlaps</b> that trailing-silence
+window; the budget formula still adds it as a deliberately conservative modeled constant.</p>
+
+<h2>2. Contributing factors</h2>
+<table>
+<tr><th>#</th><th>Factor</th><th>~Value</th><th>Type</th><th>Reducible?</th></tr>
+<tr><td>0</td><td>Encoder right-context (rc1)</td><td>160 ms</td>
+<td><span class="o">modeled</span>; overlaps the waits, and at finalize is supplied
+<b>synthetically</b> by the fork's <code>(R+1)*shift</code> zero-padding (faster-than-wallclock)</td>
+<td>Not as a streaming param (rc0 crashes upstream NeMo). But it is <b>not</b> a hard
+post-decision wall-clock cost — see §3.</td></tr>
+<tr><td>1</td><td>Silero VAD endpoint detection (<code>stop_secs</code>)</td><td>~200 ms</td>
+<td>real wall-clock, before <code>vad_stop</code>; excluded from the budget <code>endpoint_wait</code> term</td>
+<td><b>Yes</b> — biggest single lever; framework-locked in this benchmark (production-side).</td></tr>
+<tr><td>2</td><td>Server finalize debounce (<code>NEMOTRON_FINALIZE_SILENCE_MS</code>)</td>
+<td><span class="m">~151 ms → 0</span></td><td>real wall-clock (the budget <code>endpoint_wait</code>); a VAD-cancellation safety window, NOT model-settle time</td>
+<td><b>Yes — reducible to 0</b> for a definitive trigger; measured −152 ms TTFS at no WER cost (see §8).</td></tr>
+<tr><td>3</td><td>Finalize fork flush — fork build + synthetic-pad processing + delta prep,
+<i>up to send start</i> (<code>fork_flush_start→final_sent</code>)</td>
+<td><span class="m">~13–14 ms</span></td>
+<td>faster-than-wallclock (synthetic padding has no real duration)</td>
+<td>Negligible; not worth optimizing vs the waits.</td></tr>
+<tr><td>4</td><td>Transport / serialization — send + WS + client receipt
+(<code>final_sent→final_received</code>, a <i>separate</i> measured term)</td>
+<td><span class="m">~0.2 ms local</span></td>
+<td>real (network RTT in production)</td><td>Deployment-dependent.</td></tr>
+<tr><td>5</td><td>Chunk / frame quantization (fixed shift)</td><td>tens of ms (bounded by shift)</td>
+<td>real, overlaps streaming</td><td>Minor; structural.</td></tr>
+<tr><td>6</td><td><code>inference_lock</code> contention</td><td><span class="m">+0 ms to N=12; +18 ms@16; +649 ms@20</span> (incremental vs the ~15 ms single-session finalize)</td>
+<td>real under concurrency (now measured)</td><td>Flat to ~12 concurrent sessions/GPU, knee at ~16–18 (see §9).</td></tr>
+</table>
+
+<h2>3. Floors: modeled-formula vs post-decision wall-clock</h2>
+<p class="floor"><b>Two different floors — do not conflate them.</b><br>
+<b>(a) Modeled budget floor ≈ ~175 ms</b> = rc1 (160, modeled constant) + finalize flush (~14),
+<i>under the locked additive formula</i>. This is a conservative accounting floor, not a physical one.<br>
+<b>(b) True post-endpoint-decision wall-clock floor ≈ flush + transport + quantization (~tens of ms)</b>.
+Once the system <i>decides</i> to finalize, the fork supplies the last chunk's right-context as
+synthetic <code>(R+1)*shift</code> zeros (faster-than-wallclock) — it does <b>not</b> wait
+160&nbsp;ms of real audio. So rc1 is not an irreducible post-decision cost.<br>
+<b>The real limiter is the endpoint decision itself</b>: you cannot finalize until you have
+enough <i>evidence</i> that speech ended. With a perfect oracle that evidence is ~0; with any
+realistic signal it is whatever observation window that signal needs — which typically overlaps
+rc1. So the achievable target is "collapse the ~350&nbsp;ms of stacked static waits down to the
+evidence window of a good endpoint signal," not "hit a fixed 175&nbsp;ms."</p>
+
+<h2>4. What we are doing now (Step 7d, <code>fork</code>)</h2>
+<ul>
+<li><b>Short 150 ms server debounce</b> instead of the 2500 ms analytical hold (cc7b/cc7c).</li>
+<li><b>Speculative disposable fork</b>: on debounce expiry we finalize on a deep-clone fork;
+the live ASR context is untouched. If speech resumes <i>before the debounce fires</i>,
+<code>vad_start</code> cancels the pending finalize and the fork is discarded — protecting the
+live context from cold-reset damage. <b>Caveat:</b> this is harmless only <i>pre-emit</i>; once
+a speculative final is emitted it is concatenated by the append-only collector and cannot be
+revoked (see §6).</li>
+<li><b>Always-append-only emission</b> keeps the multi-segment transcript duplication-free.</li>
+<li>Preliminary measured budget p95 ~326 ms (PASS &lt; 400 ms): <span class="m">endpoint_wait
+~151</span> + <span class="o">rc1 160 (modeled)</span> + <span class="m">flush ~13</span> +
+<span class="m">transport ~0.2</span>; <span class="m">lock-wait ~0</span> (sequential).</li>
+</ul>
+
+<h2>5. How the 150 ms debounce was chosen</h2>
+<p>From the Step-1 offline Silero VAD preflight (stop→next-start gap distribution: min
+<b>154 ms</b>, p50 380 ms, p95 800 ms) <i>and</i> the locked &lt;400 ms budget allowance
+(400 − rc1 160 − flush ~14 − margin ≈ ~150). 150 ms is the <b>largest value that fits the
+budget</b> and sits just <i>below</i> the minimum observed real intra-utterance gap (154 ms),
+so a true resume almost never lands inside the window — and when it does (pre-emit), the
+fork-discard absorbs it. It is a budget-bounded, data-informed <b>static</b> choice.
+<b>Update (§8):</b> we later established the 150&nbsp;ms is purely a VAD-cancellation safety
+window (audio is held aside, not fed to the ASR), so for a <i>definitive</i> end-of-turn trigger
+it can be set to <b>0</b> with no WER change (99/100 byte-identical) — a measured −152&nbsp;ms
+TTFS win.</p>
+
+<h2>6. Can we do better than a static wait? (the real opportunity)</h2>
+<p>The debounce only proxies "<i>did the speaker actually stop, or is this a mid-utterance
+pause?</i>" A fixed timer is a blunt proxy for signals that can be derived from the ASR itself.
+<b>Important constraint:</b> today the service calls <code>conformer_stream_step(...)</code> and
+receives <i>text + hypotheses + cache state</i> — <b>not</b> per-frame RNNT blank probabilities
+or joint logits/entropy. Those are not "already in hand"; exposing them needs NeMo's
+<i>supported</i> decode instrumentation (<code>preserve_alignments</code> /
+<code>preserve_frame_confidence</code> / <code>confidence_method_cfg</code> via
+<code>change_decoding_strategy</code>) — a config change, no retraining and no framework edit,
+but its viability on this cache-aware streaming path is a <b>feasibility question to test</b>,
+not an assumption.</p>
+<table>
+<tr><th>Approach</th><th>Idea</th><th>Availability</th></tr>
+<tr><td><b>Speculative fork (already built)</b></td>
+<td>Finalize, protect live state, discard if speech resumes <i>before emit</i>.</td>
+<td>Done (7d). It bounds <i>state</i> damage, not emitted-finalize WER cost.</td></tr>
+<tr><td><b>Hypothesis stability</b></td>
+<td>Cumulative hypothesis unchanged for K chunks ⇒ decode settled ⇒ likely ended.</td>
+<td><span class="m">Available now</span> — cheap, from the committed text/deltas we already track.</td></tr>
+<tr><td><b>RNNT blank-run confidence</b></td>
+<td>Sustained high-probability <i>blank</i> emission after content ⇒ utterance ended.</td>
+<td><span class="r">Requires enabling supported decode instrumentation (alignments/confidence);
+feasibility TBD on this path. No retraining.</span></td></tr>
+<tr><td><b>Joint-distribution entropy / confidence</b></td>
+<td>Low entropy + blank-dominant posterior ⇒ confidently ended ⇒ adaptive wait.</td>
+<td><span class="r">Same as above — needs the confidence_method_cfg path exposed and verified.</span></td></tr>
+<tr><td><b>Adaptive debounce</b></td>
+<td>Short wait when the signal is confident, longer when uncertain.</td>
+<td>Composable once a signal above is validated.</td></tr>
+<tr><td><b>ASR-driven endpointing (reduce Silero <code>stop_secs</code>)</b></td>
+<td>If server-side ASR endpointing is reliable, finalize independent of the client Silero
+<code>vad_stop</code>.</td>
+<td>Production-side; the benchmark VAD is framework-locked here.</td></tr>
+<tr><td><b>Dedicated EOU head</b></td>
+<td>Lightweight end-of-utterance classifier on encoder states.</td>
+<td>Needs training / model change — <b>out of scope</b> (model locked).</td></tr>
+</table>
+<p><b>Honest framing of the win — what a false-early-fire actually costs.</b> The configured
+decode is <b>greedy</b> RNNT (<code>strategy: greedy</code>), which is <i>append-only on the
+committed token sequence</i>: it never un-emits a token. So a false-early-fire does <b>not</b>
+rewrite arbitrary earlier text, and once a frame has its full ~160 ms right context its
+decoded tokens are stable. The real cost is therefore <b>bounded and local</b>, not a global
+rewrite: (a) the still-provisional last ≤rc1 (~160 ms) tail gets flushed against the fork's
+<i>synthetic silence</i> instead of the real continuing speech, so the last word or two before
+the pause can be committed wrong; (b) a possible spurious seam token at the fake boundary; (c)
+the segmentation/restart family. All three are frozen by the append-only collector (irrevocable
+post-emit; a <i>pre-emit</i> discard is still free). This means a stability signal that waits
+until the tail has settled <i>past</i> the rc1 window is genuinely safe from the rewrite
+concern — but the seam/provisional-tail cost is still WER-gated. The earlier characterization
+("~40% non-prefix transitions ⇒ earlier text is rewritten") is <b>not</b> evidence of
+beyond-rc1 rewrite on greedy; it conflates the provisional ≤rc1 tail, interim-vs-flush tail,
+and detok/casing/punctuation churn (token-prefix-stable, semantic-WER-tolerant). Whether any
+<i>genuine</i> edit to a token older than its right-context window ever occurs on this path is
+an explicit measurement in the next-stage plan, not an assumption.</p>
+
+<h2>7. Empirical EOU result on this checkpoint (2026-05-20 follow-up)</h2>
+<p>The "speculation" table in §6 has been tested.
+<b>Verdict: NO-GO for the voice-agent end-of-turn use case on
+<code>nvidia/nemotron-speech-streaming-en-0.6b</code>.</b> The
+<code>warm200</code> shippable from the parent project remains the recommended production
+configuration.</p>
+<p><b>What we built and measured.</b> Env-gated probe instrumentation (<code>NEMOTRON_EOU_PROBE=1</code>
+with <code>preserve_alignments</code>, <code>preserve_frame_confidence</code>, and tsallis-entropy
+<code>confidence_method_cfg</code> installed via <code>change_decoding_strategy</code> at startup —
+the §6 "supported decode instrumentation" path is feasible: it is argmax-invariant to baseline and
+default-off byte-identical to <code>fork</code>/<code>warm200</code>). Per-chunk state snapshots
+(<code>NEMOTRON_EOU_SNAPSHOT_DIR=...</code>) so any operating point can be replayed offline. ROC
+sweep across the three signal families from §6 (hypothesis stability, blank-run, normalized
+confidence) at 28 operating points, on 100 LibriSpeech sessions (duration-representative of the
+full 1000).</p>
+<p><b>What we found.</b> The 28-point viability table (latency p95 ≤ {0, 50, 100, 150, 200} ms
+crossed with false-early-fire rate ≤ {0.5%, 1%, 2%, 5%}) had <b>zero matches</b>. Each signal has
+the same bimodal shape: at low K it fires constantly on natural in-utterance pauses (97-100%
+false-fire at K≤3), at high K it doesn't fire at all in most sessions (95% never-fired at K≥60
+encoder frames). The <code>hyp_unchanged K</code> and <code>blank_run K</code> signals fire on
+identical chunks at every K.</p>
+<p><b>Why (mechanism, not tuning).</b> Voice-agent end-of-turn detection must discriminate
+inter-sentence pauses (~280 ms in our data) from end-of-turn pauses (~2 s). The three signal
+families are all duration-thresholded on decoder-emission counters; they cannot do anything a
+calibrated pause-duration threshold cannot. The moment K is set large enough to ignore
+inter-sentence pauses, the wallclock latency equals Silero's. The §6 prediction "<i>a stability
+signal that waits until the tail has settled past the rc1 window is genuinely safe from the
+rewrite concern</i>" was confirmed (Step 2b's rc1-stability analysis: greedy RNNT is
+append-only on committed tokens; the rewrite concern was overstated in earlier analysis).
+<b>What the rc1-stability finding does NOT do, on this checkpoint:</b> give us a non-duration
+signal to discriminate end-of-turn from inter-sentence-pause.</p>
+<p><b>Architecturally, the silence-pump door is open</b>. The server has no per-chunk
+rate-limiting (<code>_handle_audio_locked</code> processes back-to-back, ~10 ms GPU per 160 ms
+chunk ≈ 16× compute-vs-realtime ceiling). The Step-7d fork-flush already feeds
+<code>(R+1) × shift_frames × hop_samples</code> = 320 ms of synthetic zeros through
+<code>conformer_stream_step</code> at faster-than-wallclock pace. Extending this to longer
+synthetic silence is feasible without any framework or decoder-mode change. It just doesn't help
+the end-of-turn problem: even an unbounded-K synthetic-silence pump cannot synthesize a
+non-duration signal that this decoder doesn't expose.</p>
+<p><b>The §6 table updated with results:</b></p>
+<table>
+<tr><th>Approach</th><th>Empirical result</th></tr>
+<tr><td><b>Speculative fork (built)</b></td>
+<td><span class="m">Shipping in <code>warm200</code></span> — bounds state damage, ~5–60 ms GPU.</td></tr>
+<tr><td><b>Hypothesis stability</b></td>
+<td><span class="r">Tested — fires identically to blank-run; not viable as a Silero replacement.</span></td></tr>
+<tr><td><b>RNNT blank-run confidence</b></td>
+<td><span class="r">Decoder instrumentation works (argmax-invariant); ROC sweep produced
+zero viable operating points.</span></td></tr>
+<tr><td><b>Joint-distribution entropy / confidence</b></td>
+<td><span class="r">Confidence values saturate near 1.0 throughout; insufficient dynamic range
+to discriminate speech from inter-sentence-pause.</span></td></tr>
+<tr><td><b>Adaptive debounce</b></td>
+<td><span class="r">Was contingent on a viable underlying signal; not buildable on top of any
+of the above.</span></td></tr>
+<tr><td><b>ASR-driven endpointing (reduce Silero <code>stop_secs</code>)</b></td>
+<td><span class="r">Not viable here on this checkpoint for voice-agent use case.</span></td></tr>
+<tr><td><b>Dedicated EOU head</b></td>
+<td><span class="m">Still the right architectural answer for a future model. Requires training; out of scope on the locked checkpoint.</span></td></tr>
+</table>
+<p><b>The binding endpoint-evidence floor is Silero's ~200 ms.</b> §3's two-floors framing was
+correct in shape, and we now have empirical confirmation that the endpoint-evidence floor —
+not the modeled-formula floor — is what's binding for this use case on this model.</p>
+<p><b>Caveats:</b> single checkpoint, single corpus (LibriSpeech), single language (English).
+Conversational speech with different pause distributions might shift the numbers but not the
+mechanism. A future checkpoint with an explicit EOU classifier head would change the picture
+entirely.</p>
+
+<h2>8. Finalize debounce can go to ZERO (2026-05-20, measured)</h2>
+<p>The §5 framing of the 150&nbsp;ms debounce as a budget-bounded settle margin was
+<b>incomplete</b>. Tracing the actual server code (Codex-verified): during the debounce window
+the incoming audio is <b>held aside in <code>continuous_post_stop_audio</code> and NOT fed to the
+ASR</b>; the fork-flush runs from the parent state <i>as of <code>vad_stop</code></i> regardless
+of the debounce value. So the 150&nbsp;ms is purely a <b>VAD-cancellation safety window</b>
+("wait briefly to see if the speaker resumes before committing the finalize"), not time the
+model needs to settle.</p>
+<p><b>Offline replay</b> (<code>silence_pad_replay.py</code>) over 100 sessions confirmed the
+fork's existing <code>(R+1)*shift = 320&nbsp;ms</code> synthetic pad already converges. On the
+<b>33 single-<code>vad_stop</code> baseline-comparable sessions</b> (where the production
+transcript is a clean single-segment reference), replaying from the <code>vad_stop</code> snapshot
+reproduced production at <span class="m">median edit-distance&nbsp;0, p95&nbsp;3.4 chars</span>
+(CUDA/cuFFT nondeterminism); longer pads (480/640/800&nbsp;ms) did not improve this, while
+1200&nbsp;ms actively degraded (out-of-distribution synthetic input). (The remaining 67 sessions
+are multi-<code>vad_stop</code> continuous-mode runs whose DB baseline is the concatenated
+multi-segment aggregate, so the single-fork replay's larger edit-distance there is expected, not a
+defect.) <b>Measured</b> 100-sample A/B (<code>silence_0</code> vs <code>silence_150</code>):
+normalized word-error-rate vs ground truth <span class="m">identical (4.286% both,
+Δ&nbsp;0.0000&nbsp;pp; computed directly against ground truth — the Gemini/Claude semantic judge
+is even more tolerant)</span>, transcripts <span class="m">99/100 byte-identical</span> (the one
+diff a single inserted period), at <span class="m">TTFB&nbsp;215&nbsp;ms vs 367&nbsp;ms — a
+152&nbsp;ms reduction</span>.</p>
+<p class="key"><b>Result.</b> For a use case with a <i>definitive</i> end-of-turn trigger (e.g.
+Smart Turn) — or where the segmentation cost of an occasional early finalize is acceptable —
+<code>NEMOTRON_FINALIZE_SILENCE_MS=0</code> drops TTFS p95 from ~366&nbsp;ms to
+<b>~215&nbsp;ms</b> with no transcript change. The fork's unfork-safe state preservation (deep
+clone; <code>FORK_ASSERT</code>-verified) means a false-early fire is recoverable: emit the
+finalize now, keep processing the retained context, continue on the next utterance. The 150&nbsp;ms
+remains the right setting only when the trigger itself is unreliable (Silero pause vs end-of-turn
+ambiguity) and the safety window is doing real cancellation work.</p>
+<p class="floor"><b>Ship-gate confirmation (full 1000, measured 2026-05-20).</b> A full-1000 run of
+<code>silence0_warm200</code> at concurrency&nbsp;12, scored by the Claude semantic-WER judge:
+<span class="m">pooled semantic WER 1.95%</span> vs warm200's 2.07% / fork's 2.08% — <b>non-inferior</b>
+(the ~0.1&nbsp;pp delta is within judge + sampling noise; the baselines were scored in a separate
+judge run, so this is not a paired comparison). <span class="m">TTFB p95 247&nbsp;ms</span> under
+12-way concurrency vs warm200's 366&nbsp;ms single-session — a <b>~119&nbsp;ms reduction</b>. Both
+ship-gate criteria met: WER non-inferior to <code>warm200</code> AND latency well inside the
+400&nbsp;ms budget. <b><code>silence0_warm200</code> is the recommended production configuration</b>
+for a definitive-trigger use case, superseding bare <code>warm200</code>.</p>
+
+<h2>9. Concurrency / capacity (2026-05-20, measured — R4 caveat closed)</h2>
+<p>The server does <b>no request batching</b> — every <code>conformer_stream_step</code> is
+serialized through one global <code>inference_lock</code>, model <code>batch_size=1</code> by
+design (the batch API corrupts the cache-aware streaming state). A realtime concurrent sweep
+(<code>concurrency_test.py</code>, N&nbsp;∈&nbsp;{1,4,8,12,16,20,24} live sessions, production
+<code>silence_0&nbsp;+&nbsp;warm200</code> config) found:</p>
+<table>
+<tr><th>N concurrent</th><th>byte-accuracy</th><th>server finalize p95 (<code>vad_stop→final</code>)</th><th>end-to-end TTFS ≈ +200 ms Silero</th></tr>
+<tr><td>1–12</td><td class="m">100% exact</td><td class="m">~15 ms (flat)</td><td>~215 ms — in budget, comfortable</td></tr>
+<tr><td>16</td><td class="m">100% exact</td><td class="m">33 ms</td><td>~233 ms — in budget, edge</td></tr>
+<tr><td>20</td><td class="m">100% exact</td><td class="m">664 ms</td><td>~864 ms — OUT of budget</td></tr>
+<tr><td>24</td><td class="m">100% exact</td><td class="m">2082 ms</td><td>~2280 ms — server behind realtime</td></tr>
+</table>
+<p><b>Correctness is perfect at every N</b> (max edit-distance 0 vs single-session baseline,
+<code>FORK_ASSERT</code> clean) — the serialized-inference + per-session-cache design degrades
+<i>gracefully</i>: latency only, never correctness, even when overwhelmed. <b>Capacity: ~12
+concurrent live sessions per RTX&nbsp;5090 comfortably in-budget, ~16 at the edge</b>; the single
+<code>inference_lock</code> saturates at ~N=16–18. Scales horizontally (capacity = per-GPU-ceiling
+× instances). Warm-up (<code>warm200</code>) connect contention is negligible (ready p95 ≤ 52&nbsp;ms
+at N=24). The unexplored lever for higher per-GPU throughput is vLLM-style continuous batching on
+the cache-aware streaming path — significant work, not yet attempted. <small>(Scope: measured on
+one RTX&nbsp;5090, this checkpoint, a 24-audio realtime sweep with tightly-grouped randomized
+starts; production hardware/traffic could shift the knee.)</small></p>
+
+<h2>10. Honest caveats</h2>
+<ul>
+<li><b>Two floors, not one.</b> ~175 ms is a modeled <i>formula</i> floor; the true
+post-decision wall-clock floor is lower (synthetic rc1) and the binding limit is the
+endpoint-evidence window of whatever signal triggers finalize.</li>
+<li><b>Measured vs modeled vs reasoned.</b> endpoint_wait/flush/transport/lock are measured;
+rc1 (160 ms) is a modeled constant; the rc1↔wait overlap and the floor reasoning are
+reasoned, to be cross-checked by the run-end observer-TTFS.</li>
+<li><b>Greedy append-only / rc1-stability is reasoned, then measured.</b> "Committed tokens
+are not rewritten beyond their rc1 window on greedy" follows from the decode algorithm, but
+the next-stage plan instruments per-chunk token sequences to <i>quantify</i> any genuine
+older-than-rc1 edit (expected ≈0) rather than assume it — that result sets how aggressive
+the endpoint trigger can safely be.</li>
+<li><b>Preliminary.</b> Budget p95 ~326 ms is from ~499/1000 samples; per-term distributions
+are tight, so it is unlikely to move materially.</li>
+<li><b>Concurrency (R4) — now measured (§9).</b> Correctness is byte-exact to N=24; latency is
+flat to ~12 concurrent sessions/GPU, knee at ~16–18. The earlier "not captured" caveat is closed.</li>
+<li><b>WER is decided separately.</b> Low latency only counts if the always-append-only
+<code>fork</code> WER lands in the Phase-G/oracle region — that gate is pending the
+judge/score at run completion.</li>
+</ul>
+
+</body>
+</html>
