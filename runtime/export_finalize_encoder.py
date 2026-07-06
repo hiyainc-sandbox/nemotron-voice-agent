@@ -19,8 +19,9 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from finalize_ref import (
@@ -94,23 +95,64 @@ def _first_token_diff(lhs: list[int], rhs: list[int]) -> str:
     return "identical"
 
 
-def _make_row(rt: ContinuousFinalizeRef, ds, sample_index: int, kind: str) -> dict[str, Any]:
+def _fit_length(wav: np.ndarray, n: int) -> np.ndarray:
+    """Tile-or-clip a real utterance to exactly n samples. Audio content is
+    irrelevant to the finalize geometry (T depends only on length), and the
+    oracle gate is self-consistent on whatever audio we feed."""
+    if len(wav) == 0:
+        raise ValueError("empty source wav")
+    if len(wav) >= n:
+        return wav[:n].copy()
+    reps = -(-n // len(wav))  # ceil
+    return np.tile(wav, reps)[:n].copy()
+
+
+def _prepare_session(
+    rt: ContinuousFinalizeRef,
+    ds,
+    sample_index: int,
+    kind: str,
+    target_samples: Optional[int] = None,
+):
+    """Build a session fed to the target audio length. Returns (ex, wav, session)
+    or None if the resulting steady-emission regime doesn't match the requested
+    kind (first => emitted_frames==0/drop=0; continuation => emitted_frames>0/drop=2)."""
     ex = ds[sample_index]
     wav = load_wav(ex)
-    session = rt.new_session(f"fixture-{kind}-{sample_index}")
 
-    if kind == "continuation":
-        rt.append_audio(session, wav)
-    elif kind == "first":
+    if kind == "first":
         # Production can only finalize with emitted_frames==0 before the first
         # steady chunk is ready, so clip below preprocess_new_audio_samples.
-        wav = wav[: rt.geometry.preprocess_new_audio_samples - 1].copy()
-        rt.append_audio(session, wav)
-        if session.emitted_frames != 0:
-            raise RuntimeError("first finalize fixture unexpectedly emitted steady frames")
+        limit = rt.geometry.preprocess_new_audio_samples - 1
+        n = limit if target_samples is None else min(int(target_samples), limit)
+        wav = wav[:n].copy()
+    elif kind == "continuation":
+        if target_samples is not None:
+            wav = _fit_length(wav, int(target_samples))
     else:
         raise ValueError(f"unknown fixture kind {kind!r}")
 
+    session = rt.new_session(f"fixture-{kind}-{sample_index}")
+    rt.append_audio(session, wav)
+
+    if kind == "first" and session.emitted_frames != 0:
+        return None
+    if kind == "continuation" and session.emitted_frames == 0:
+        return None
+    return ex, wav, session
+
+
+def _make_row(rt: ContinuousFinalizeRef, ds, sample_index: int, kind: str) -> dict[str, Any]:
+    prepared = _prepare_session(rt, ds, sample_index, kind)
+    if prepared is None:
+        raise RuntimeError(
+            f"regime mismatch building fixture: sample_index={sample_index} kind={kind}"
+        )
+    ex, wav, session = prepared
+    return _finish_row(rt, ex, wav, session, kind, sample_index)
+
+
+def _finish_row(rt, ex, wav, session, kind: str, sample_index: int) -> dict[str, Any]:
     fork = rt.build_continuous_finalize_fork(session)
     pre_final_tokens = list(fork.hyp_tokens)
     pre_final_decoder_state = _cpu_tree(fork.decoder_state)
@@ -123,7 +165,18 @@ def _make_row(rt: ContinuousFinalizeRef, ds, sample_index: int, kind: str) -> di
 
     finalize_ref_tokens = list(flush["final_tokens"])
     oracle_tokens = rt.nemo_stream_finalize_tokens(wav)
-    offline_tokens = rt.offline_full_greedy_tokens(wav)
+    # Diagnostic-only reference (not used by the bucket export or the oracle gate).
+    # Sweep rows can be as short as ~160 samples, which underflows the offline
+    # preprocessor's STFT (n_fft padding > input); zero-pad to the runtime's
+    # constant preprocess floor for the offline call only. The streaming session
+    # above already produced the actual fixture geometry from the un-padded clip.
+    offline_wav = wav
+    floor = rt.geometry.constant_preprocess_samples
+    if len(offline_wav) < floor:
+        offline_wav = np.concatenate(
+            [offline_wav, np.zeros(floor - len(offline_wav), dtype=np.float32)]
+        )
+    offline_tokens = rt.offline_full_greedy_tokens(offline_wav)
     oracle_match = finalize_ref_tokens == oracle_tokens
     new_tokens = oracle_tokens[len(pre_final_tokens) :]
     return {
@@ -170,6 +223,57 @@ def _row_inputs_cuda(row: dict[str, Any], device):
     )
 
 
+# The finalize AOTI bucket grid: both drop regimes reduce to the same window of
+# remaining_frames (34..49). drop=0 => T == remaining_frames; drop=2 =>
+# T == pre_encode_cache_size + remaining_frames. See ARTIFACTS.md ("32 finalize buckets").
+DROP0_T = range(34, 50)  # 16 buckets, T == remaining_frames
+DROP2_T = range(43, 59)  # 16 buckets, T == pre_encode_cache_size + remaining_frames
+TARGETS: set[tuple[int, int]] = {(0, t) for t in DROP0_T} | {(2, t) for t in DROP2_T}
+
+
+def _sweep_rows(rt: ContinuousFinalizeRef, ds) -> list[dict[str, Any]]:
+    """Sweep audio lengths to materialize one fixture row per (drop, T) bucket in
+    the full 32-bucket grid. remaining_frames = len(pending_audio)//hop + 1, so
+    stepping the fed length by hop_samples walks T by 1; each row is binned by its
+    observed (drop, T) and kept only if it fills a needed, still-empty bucket."""
+    g = rt.geometry
+    hop = g.hop_samples
+    pad = g.final_padding_frames * hop  # fixed final-pad samples in every fork
+    rows: dict[tuple[int, int], dict[str, Any]] = {}
+
+    # drop=0: emitted_frames stays 0, so clip length sets T directly and exactly.
+    for T in DROP0_T:
+        clip = (T - 1) * hop - pad  # invert remaining = (clip+pad)//hop + 1
+        if not 0 < clip < g.preprocess_new_audio_samples:
+            raise RuntimeError(f"drop=0 T={T} clip={clip} outside first-chunk regime")
+        prepared = _prepare_session(rt, ds, 5, "first", target_samples=clip)
+        if prepared is None:
+            continue
+        row = _finish_row(rt, *prepared, "first", 5)
+        key = (row["drop_extra"], row["chunk_T"])
+        if key == (0, T):
+            rows[key] = row
+
+    # drop=2: past the first steady chunk, remaining cycles through 16 consecutive
+    # values per shift period; sweep 2 periods (safety margin) and bin what lands.
+    base = 6 * g.shift_frames * hop
+    for k in range(2 * g.shift_frames):
+        prepared = _prepare_session(rt, ds, 4, "continuation", target_samples=base + k * hop)
+        if prepared is None:
+            continue
+        row = _finish_row(rt, *prepared, "continuation", 4)
+        key = (row["drop_extra"], row["chunk_T"])
+        if key in TARGETS and key not in rows:
+            rows[key] = row
+        if TARGETS <= rows.keys():
+            break
+
+    missing = sorted(TARGETS - rows.keys())
+    if missing:
+        raise RuntimeError(f"length sweep failed to cover {len(missing)} buckets: {missing}")
+    return [rows[key] for key in sorted(rows)]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="./artifacts")
@@ -182,12 +286,7 @@ def main() -> int:
     ds = load_benchmark_dataset()
     device = rt.device
 
-    rows = [
-        _make_row(rt, ds, 5, "first"),
-        _make_row(rt, ds, 4, "continuation"),
-        _make_row(rt, ds, 9, "continuation"),
-        _make_row(rt, ds, 2, "continuation"),
-    ]
+    rows = _sweep_rows(rt, ds)
 
     fixture_path = os.path.join(args.out, "finalize_fixture.pt")
     meta = {
