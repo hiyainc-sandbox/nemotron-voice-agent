@@ -77,8 +77,10 @@ install_os_deps() {
     curl \
     ninja-build \
     python3-dev \
-    python3-venv \
-    awscli >/dev/null
+    python3-venv >/dev/null
+    #\
+    #awscli >/dev/null
+  #sudo_cmd sudo snap install aws-cli --classic
 
   command -v cmake >/dev/null 2>&1 || die "cmake not found after apt install"
   command -v g++ >/dev/null 2>&1 || die "g++ not found after apt install"
