@@ -19,7 +19,7 @@ from typing import Any
 from strip_bucket_weights import fmt_bytes, is_weight_entry, sha256_file, strip_package
 
 
-DEFAULT_BUCKETS = (1, 2, 4)
+DEFAULT_BUCKETS = (1, 2, 4, 8, 16)
 
 
 def package_name(bucket: int) -> str:
