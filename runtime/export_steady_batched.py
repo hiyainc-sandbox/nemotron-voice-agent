@@ -318,6 +318,7 @@ def compile_batch(
     atol: float,
     rtol: float,
     self_check: bool,
+    self_check_weights: str | None = None,
 ) -> None:
     remove_if_exists(pkg_path)
     ep = torch.export.load(ep_path)
@@ -330,7 +331,29 @@ def compile_batch(
     print(f"AOTI package: {out_path}", flush=True)
 
     if self_check and example is not None and eager is not None:
+        # These packages are compiled constants-on-disk (weights live OUTSIDE the
+        # .so so the runtime can bind ONE shared set across buckets). The AOTI
+        # runner segfaults if run before its constants are bound, so we must wire
+        # the shared weight set via load_constants first -- exactly what the
+        # deploy path and aot_compile_buckets.self_check_package do. Running the
+        # runner naked (the old behaviour) crashed the process with no traceback.
+        from aot_compile_buckets import SharedWeights
+
+        if not self_check_weights or not Path(self_check_weights).exists():
+            raise FileNotFoundError(
+                "self-check requires the shared weights dict (.pt); "
+                f"missing or unset: {self_check_weights!r} "
+                "(pass --self-check-weights, or --no-self-check to skip)"
+            )
         runner = torch._inductor.aoti_load_package(out_path)
+        shared = SharedWeights(self_check_weights)
+        cmap, fqn_count, direct, alias = shared.constants_for_runner(runner)
+        runner.loader.load_constants(cmap, False, False, True)
+        print(
+            f"  self-check constants bound: matched={len(cmap)}/{fqn_count} "
+            f"direct={direct} alias={alias}",
+            flush=True,
+        )
         with torch.inference_mode():
             got = runner(*example)
         got_tuple = tuple(got) if isinstance(got, (tuple, list)) else (got,)
@@ -346,6 +369,8 @@ def main() -> None:
     parser.add_argument("--export-only", action="store_true", help="save ExportedPrograms but do not AOTI-compile")
     parser.add_argument("--manifest-only", action="store_true", help="only write MANIFEST.json for existing AOTI packages")
     parser.add_argument("--no-self-check", action="store_true", help="skip post-compile AOTI vs eager check")
+    parser.add_argument("--self-check-weights", default="./artifacts/finalize_shared_weights.pt",
+                        help="shared weights dict (.pt) bound into the constants-on-disk package for the self-check")
     parser.add_argument("--shared-weights", default="./artifacts/finalize_shared_weights.ts")
     parser.add_argument("--production-b1", default="./artifacts/enc_steady_aoti.pt2")
     parser.add_argument("--atol", type=float, default=5e-2)
@@ -404,6 +429,7 @@ def main() -> None:
                 atol=args.atol,
                 rtol=args.rtol,
                 self_check=not args.no_self_check and not args.compile_only,
+                self_check_weights=args.self_check_weights,
             )
 
         gc.collect()
