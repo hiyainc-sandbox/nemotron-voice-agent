@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# On-box density sweep for a g6e/L40S (sm_89) DL Base AMI.
+# On-box density sweep for an Ada/Ampere GPU (default L40S/L4 sm_89) DL Base AMI.
 #
-# Run after this runtime subset is rsynced to the g6e. The script obtains the
-# arch-agnostic source ExportedPrograms (EPs), compiles native sm_89 autotune-off
-# AOTI packages into artifacts_sm89/, builds density_main, and runs each N in a
+# Retarget with TARGET_CC (CUDA compute capability of THIS box):
+#   TARGET_CC=8.6  -> A10G (Ampere), artifacts_sm86/, torch280-sm86-venv
+#   TARGET_CC=8.9  -> L40S / L4 (Ada), artifacts_sm89/  (default; original behavior)
+# Must run ON the target GPU — AOTI/Triton codegen targets the live device; you cannot
+# cross-compile from a different arch.
+#
+# Run after this runtime subset is rsynced to the box. The script obtains the
+# arch-agnostic source ExportedPrograms (EPs), compiles native $TARGET_SM autotune-off
+# AOTI packages into artifacts_$TARGET_SM/, builds density_main, and runs each N in a
 # fresh process.
 #
 # Two ways to supply the source EPs (see runtime/ARTIFACTS.md):
@@ -18,12 +24,20 @@ IFS=$'\n\t'
 cd "$(dirname "${BASH_SOURCE[0]}")"
 ROOT=$(pwd -P)
 
-EPS_LOCAL=${EPS_LOCAL:-0}                       # 1 = use EPs already present in artifacts_sm89/ (no S3)
+# Target GPU architecture. TARGET_CC is the CUDA compute capability of the box this runs on:
+#   8.6 = A10G (Ampere), 8.9 = L40S / L4 (Ada), 8.0 = A100, ...
+# It drives TORCH_CUDA_ARCH_LIST, the device-capability assertion, and the arch-tagged artifact/venv/
+# build dirs below. Default 8.9 preserves the original L40S behavior.
+TARGET_CC=${TARGET_CC:-"8.9"}
+TARGET_SM="sm_${TARGET_CC/./}"                   # arch token: 8.6 -> sm_86, 8.9 -> sm_89 (matches torch get_arch_list)
+TARGET_TAG="sm${TARGET_CC/./}"                   # dir/venv suffix (no underscore): 8.6 -> sm86, 8.9 -> sm89
+
+EPS_LOCAL=${EPS_LOCAL:-0}                       # 1 = use EPs already present in the target artifacts dir (no S3)
 S3_URI=${S3_URI:-"s3://YOUR-BUCKET/density"}     # only used when EPS_LOCAL != 1; point at your own bucket
-ART_SM89=${ART_SM89:-"$ROOT/artifacts_sm89"}
-VENV=${VENV:-"$HOME/torch280-sm89-venv"}
+ART_SM89=${ART_SM89:-"$ROOT/artifacts_${TARGET_TAG}"}
+VENV=${VENV:-"$HOME/torch280-${TARGET_TAG}-venv"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
-BUILD_DIR=${BUILD_DIR:-"$ROOT/cpp/build_l40s_density"}
+BUILD_DIR=${BUILD_DIR:-"$ROOT/cpp/build_${TARGET_TAG}_density"}
 SELF_CHECK_ATOL=${SELF_CHECK_ATOL:-0.1}
 DENSITY_N_VALUES=${DENSITY_N_VALUES:-"1,8,16,24,32,40,48,64,80"}
 DENSITY_SESSIONS_PER_WORKER=${DENSITY_SESSIONS_PER_WORKER:-0}
@@ -189,18 +203,22 @@ configure_aoti_env() {
   export TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=0
   export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM=0
   export TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE=0
-  export TORCH_CUDA_ARCH_LIST="8.9"
+  export TORCH_CUDA_ARCH_LIST="$TARGET_CC"
   unset TORCHINDUCTOR_FREEZING
   log "AOTI compile env: autotune OFF, TORCHINDUCTOR_CACHE_DIR=$TORCHINDUCTOR_CACHE_DIR"
 }
 
 check_torch_cuda() {
-  log "checking torch 2.8.0 CUDA device and sm_89 capability"
-  "$PY" - <<'PY'
+  log "checking torch 2.8.0 CUDA device and $TARGET_SM capability"
+  "$PY" - "$TARGET_CC" "$TARGET_SM" <<'PY'
 import os
 import platform
+import sys
 import torch
 import torch._inductor.config as config
+
+cc_want = tuple(int(x) for x in sys.argv[1].split("."))
+sm_want = sys.argv[2]
 
 print("python_machine", platform.machine())
 print("torch", torch.__version__, "torch_cuda", torch.version.cuda)
@@ -215,20 +233,22 @@ cc = tuple(torch.cuda.get_device_capability())
 arch = torch.cuda.get_arch_list()
 print("device", torch.cuda.get_device_name(0), "cc", cc)
 print("arch_list", arch)
-if cc != (8, 9):
-    raise SystemExit(f"expected L40S sm_89 device capability (8, 9), got {cc}")
+if cc != cc_want:
+    raise SystemExit(f"expected {sm_want} device capability {cc_want}, got {cc}")
 # The stock torch 2.8.0+cu128 wheel ships SASS for sm_86/sm_90/sm_120 but NOT sm_89.
 # That arch_list is about PREBUILT kernels and does NOT gate AOTI codegen: Inductor/Triton
-# compile hot kernels for the LIVE device (sm_89), and the cpp/nvcc parts honor
-# TORCH_CUDA_ARCH_LIST. Device cc==(8,9) is the real hardware gate (asserted above); the
-# meaningful AOTI-target gate is that TORCH_CUDA_ARCH_LIST requests 8.9.
+# compile hot kernels for the LIVE device, and the cpp/nvcc parts honor TORCH_CUDA_ARCH_LIST.
+# Device cc==cc_want is the real hardware gate (asserted above); the meaningful AOTI-target gate
+# is that TORCH_CUDA_ARCH_LIST requests the target cc. (For sm_86 the wheel already ships SASS,
+# so this branch is a no-op; it only fires for archs the wheel lacks, e.g. sm_89.)
+cc_str = sys.argv[1]
 arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
 print("TORCH_CUDA_ARCH_LIST", repr(arch_list_env))
-if "sm_89" not in arch:
-    print(f"WARNING: wheel arch_list lacks sm_89 ({arch}); AOTI targets sm_89 via TORCH_CUDA_ARCH_LIST")
-    if "8.9" not in arch_list_env:
+if sm_want not in arch:
+    print(f"WARNING: wheel arch_list lacks {sm_want} ({arch}); AOTI targets {sm_want} via TORCH_CUDA_ARCH_LIST")
+    if cc_str not in arch_list_env:
         raise SystemExit(
-            f"sm_89 absent from wheel arch_list AND TORCH_CUDA_ARCH_LIST does not request 8.9: {arch_list_env!r}"
+            f"{sm_want} absent from wheel arch_list AND TORCH_CUDA_ARCH_LIST does not request {cc_str}: {arch_list_env!r}"
         )
 if not hasattr(torch._inductor, "aoti_compile_and_package"):
     raise SystemExit("torch._inductor.aoti_compile_and_package is missing")
@@ -488,7 +508,7 @@ PY
 }
 
 prepare_artifact_workdir() {
-  log "preparing native sm_89 artifact workdir: $ART_SM89"
+  log "preparing native $TARGET_SM artifact workdir: $ART_SM89"
   need_file "$ART_SM89/enc_steady_t2a.pt2"
   need_file "$ART_SM89/t2a_io.pt"
   need_file "$ART_SM89/session_bundle.ts"
@@ -510,7 +530,7 @@ prepare_artifact_workdir() {
 }
 
 compile_steady_sm89() {
-  log "native sm_89 AOTI compile, autotune OFF: enc_steady_t2a.pt2 -> enc_steady_aoti.pt2"
+  log "native $TARGET_SM AOTI compile, autotune OFF: enc_steady_t2a.pt2 -> enc_steady_aoti.pt2"
   local script_art="$ROOT/artifacts"
   local art_real script_real
   art_real=$(realpath "$ART_SM89")
@@ -601,7 +621,7 @@ compile_strip_bucket() {
   mkdir -p "$one_dir"
   ln -sfn "$(realpath "$ep")" "$one_dir/$base"
 
-  log "native sm_89 AOTI compile bucket, autotune OFF: $base"
+  log "native $TARGET_SM AOTI compile bucket, autotune OFF: $base"
   "$PY" "$ROOT/aot_compile_buckets.py" \
     --dir "$one_dir" \
     --shared-weights "$ART_SM89/finalize_shared_weights.pt" \
@@ -629,7 +649,7 @@ compile_strip_bucket() {
 }
 
 compile_finalize_buckets_sm89() {
-  log "native sm_89 AOTI compile + strip for 32 finalize buckets, self-check-atol=$SELF_CHECK_ATOL"
+  log "native $TARGET_SM AOTI compile + strip for 32 finalize buckets, self-check-atol=$SELF_CHECK_ATOL"
   local -a eps=()
   while IFS= read -r path; do
     eps+=("$path")
@@ -1009,7 +1029,7 @@ run_density_sweep_fresh_process_per_n() {
 }
 
 main() {
-  log "starting on-box L40S W3 run, root=$ROOT"
+  log "starting on-box $TARGET_SM (cc=$TARGET_CC) W3 run, root=$ROOT"
   nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader || true
 
   install_os_deps

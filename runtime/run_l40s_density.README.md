@@ -2,8 +2,12 @@
 
 Run `run_l40s_density.sh` on the g6e/L40S box after rsyncing the code subset below to `~/density/`.
 The script is an on-box workflow: it installs/checks the DL-AMI build environment, obtains the arch-agnostic
-source ExportedPrograms (EPs), compiles native sm_89 AOTI packages with autotune off, builds `cpp/density_main`,
-and runs the density sweep fresh-process-per-N.
+source ExportedPrograms (EPs), compiles native AOTI packages with autotune off (sm_89 by default), builds
+`cpp/density_main`, and runs the density sweep fresh-process-per-N.
+
+> **Multi-GPU:** the script is arch-parameterized via `TARGET_CC` (the CUDA compute capability of the box it
+> runs on). It defaults to `8.9` (L40S / L4). Set `TARGET_CC=8.6` to target an **A10G** (Ampere), `8.0` for an
+> **A100**, etc. See [Retargeting to another GPU architecture](#retargeting-to-another-gpu-architecture) below.
 
 **Source EPs — two ways (see [`ARTIFACTS.md`](ARTIFACTS.md)):**
 
@@ -14,6 +18,73 @@ and runs the density sweep fresh-process-per-N.
    `aws s3 cp`s them and SHA-verifies `eps_manifest.json`. No bucket is shipped with this repo.
 
 It does not launch an instance.
+
+## Retargeting to another GPU architecture
+
+The model is compiled into **AOTInductor `.pt2` packages that are GPU-architecture-specific** — an sm_89
+package will not load on an sm_86 device and vice versa. Retargeting to a new GPU is driven by a single
+variable, `TARGET_CC`, the CUDA compute capability of the box the script runs on.
+
+```bash
+# A10G (Ampere, sm_86):
+cd ~/density && TARGET_CC=8.6 EPS_LOCAL=1 ./run_l40s_density.sh
+# L40S / L4 (Ada, sm_89) — the default, unchanged:
+cd ~/density && EPS_LOCAL=1 ./run_l40s_density.sh
+```
+
+### What `TARGET_CC` drives
+
+Setting `TARGET_CC=X.Y` derives two tokens and threads them through the whole compile:
+
+| derived | value for `8.6` | value for `8.9` (default) | used for |
+|---|---|---|---|
+| `TARGET_SM` (arch token, `sm_${cc}`) | `sm_86` | `sm_89` | `TORCH_CUDA_ARCH_LIST`, device-capability assertion, wheel `get_arch_list()` membership check, log lines |
+| `TARGET_TAG` (dir suffix, no underscore) | `sm86` | `sm89` | `artifacts_sm86/`, `torch280-sm86-venv`, `cpp/build_sm86_density/` |
+
+Concretely, `TARGET_CC=8.6`:
+- exports `TORCH_CUDA_ARCH_LIST=8.6` for the AOTI compile,
+- asserts the live device is compute capability `(8, 6)` (fail-closed — a mismatched box is rejected before
+  compiling, e.g. `expected sm_86 device capability (8, 6), got (8, 9)`),
+- writes all artifacts to `artifacts_sm86/`, uses venv `~/torch280-sm86-venv`, builds in `cpp/build_sm86_density/`.
+
+Override any of these individually with the usual env vars (`ART_SM89=…`, `VENV=…`, `BUILD_DIR=…`) if you need
+non-default paths; `TARGET_CC` only sets their defaults.
+
+### Why this is the *only* change needed
+
+The two-stage artifact pipeline (see [`ARTIFACTS.md`](ARTIFACTS.md)) is built for exactly this. Stage-1 **export**
+(`export_*.py`) produces **architecture-agnostic** intermediates — all `*.ts` TorchScript modules and all `*.pt2`
+**ExportedPrograms** (the steady encoder EP, the 32 finalize-bucket EPs, shared weights, session bundle). These are
+portable across GPUs: export once on any torch+NeMo host (the 5090 dev box is fine), rsync into the target's
+`artifacts_<tag>/`, done. Only stage-2 (AOTI compile + strip) is arch-specific, and it is entirely driven by the
+live device + `TORCH_CUDA_ARCH_LIST` — the compile/strip Python (`aot_compile*.py`, `aot_compile_buckets.py`,
+`strip_*.py`) contains **no** arch tokens, and the **C++/CMake build is arch-neutral** (`cpp/CMakeLists.txt` is
+`LANGUAGES C CXX` — no nvcc, no `-arch`, no `CMAKE_CUDA_ARCHITECTURES`; the binaries just `dlopen` the `.pt2` at
+runtime). So `run_l40s_density.sh` is the single place the arch is gated.
+
+### Per-GPU notes
+
+- **A10G (sm_86):** the stock `torch 2.8.0+cu128` wheel already ships prebuilt SASS for sm_86 (unlike sm_89), so the
+  wheel-`arch_list` sanity check is a clean no-op — sm_86 is actually better-supported than sm_89 was. **24 GB** of
+  VRAM (vs the L40S's 48 GB) means the density knee-N is lower and you will hit the memory-bound regime sooner; that
+  is a capacity difference, not a compile problem. AWS: `g5` instances.
+- **L4 (sm_89):** L4 is the *same* architecture as the L40S — it needs **no** new compile at all. The existing sm_89
+  artifacts run on an L4 as-is; only capacity/density-N differs (L4 is also 24 GB). Just run the default.
+- **Must compile on the target GPU.** AOTI/Triton codegen targets the *live* device — you cannot cross-compile sm_86
+  from a 5090/L40S box. Run the script on the actual A10G.
+
+### Optional — full `ws_server` serving on the new arch
+
+This script covers the density sweep, which needs only the steady encoder + the 32 finalize buckets. Serving via
+`ws_server` additionally needs the **batched-steady buckets** (`steady_b_artifacts_b16/enc_steady_aoti_b{1,2,4,8,16}.pt2`),
+which are also arch-specific and are **not** produced here. Compile them on the target GPU:
+
+```bash
+TORCH_CUDA_ARCH_LIST=8.6 python export_steady_batched.py --out ./artifacts_sm86 --compile-only
+python strip_steady_buckets.py    # rebinds the shared weight set
+```
+
+(`enc_first` is consumed by the server as arch-agnostic `enc_first.ts`, so it needs no AOTI recompile.)
 
 ## Run Command
 
@@ -32,6 +103,7 @@ Useful overrides:
 
 ```bash
 EPS_LOCAL=1 ./run_l40s_density.sh                              # no-S3 path: use pre-placed EPs in artifacts_sm89/
+TARGET_CC=8.6 EPS_LOCAL=1 ./run_l40s_density.sh                # retarget A10G/sm_86 (EPs pre-placed in artifacts_sm86/)
 DENSITY_N_VALUES=1,8,16,24,32,40,48,64,80 ./run_l40s_density.sh
 FORCE_S3_DOWNLOAD=1 ./run_l40s_density.sh                      # S3 mode only: re-download even if files exist
 DENSITY_TREAT_NO_PASS_AS_FAILURE=1 ./run_l40s_density.sh
@@ -62,7 +134,7 @@ the venv `nvidia/*/lib` (where cudart-12 lives) + cuda-13/lib64:
 cd ~/density
 LD=/home/ubuntu/torch280-sm89-venv/lib/python3.10/site-packages
 export LD_LIBRARY_PATH="$LD/torch/lib:$(ls -d $LD/nvidia/*/lib | tr '\n' ':')/usr/local/cuda-13.0/lib64"
-BIN=./cpp/build_l40s_density/density_main
+BIN=./cpp/build_sm89_density/density_main    # build dir is arch-tagged: build_sm86_density on an A10G, etc.
 # The default density policy counts cross-arch interim event-timing drifts but does not gate on them.
 # Set DENSITY_GOLD_EVENTS_TOLERANT=1 only for opt-in strict byte-exact event debug runs.
 ```
@@ -102,11 +174,14 @@ phase=measured-gate`. Keep autotune OFF (same as the sweep). Both tools profile 
    `awscli`, `curl`, and certs.
 2. Locates system CUDA and `nvcc` under `/usr/local/cuda*`.
 3. Creates a `torch==2.8.0` venv with `uv` when available, otherwise `venv` plus `pip`.
-4. Confirms the box is x86_64 and `torch.cuda.get_device_capability()==(8, 9)`.
+4. Confirms the box is x86_64 and `torch.cuda.get_device_capability()` matches `TARGET_CC` (default `(8, 9)`;
+   `(8, 6)` when `TARGET_CC=8.6`). Fail-closed: a device whose capability differs from `TARGET_CC` is rejected
+   before any compile.
 5. Ports the bare-AMI AOTI fixes: `python3-dev`, unversioned `libcuda.so` plus CUDA stub symlink for Triton link
    probes, and fail-closed `-Wl,-z,noexecstack` injection during AOTI shared-library links.
-6. Obtains source EPs into `artifacts_sm89/`: with `EPS_LOCAL=1` it uses the pre-placed EPs (no S3); otherwise it
-   downloads from `$S3_URI` and verifies SHA256s against `eps_manifest.json`.
+6. Obtains source EPs into the arch-tagged artifacts dir (`artifacts_sm89/` by default, `artifacts_sm86/` when
+   `TARGET_CC=8.6`): with `EPS_LOCAL=1` it uses the pre-placed EPs (no S3); otherwise it downloads from `$S3_URI`
+   and verifies SHA256s against `eps_manifest.json`.
 7. Compiles `enc_steady_t2a.pt2` to `artifacts_sm89/enc_steady_aoti.pt2`, autotune off.
 8. Compiles the 32 finalize bucket EPs with `aot_compile_buckets.py`, runs per-bucket self-checks at
    `SELF_CHECK_ATOL=0.1`, strips weights with `strip_bucket_weights.py`, and writes
@@ -148,8 +223,9 @@ Rsync subtotal: **468,362 bytes = 0.468 MB**.
 
 ## Source artifact set (the EPs the sweep needs)
 
-These are the keys placed under `artifacts_sm89/` — by `EPS_LOCAL=1` rsync (recommended) or by S3 download into
-your own bucket. Sizes below are from a validated artifact set. In S3 mode the script fail-closes on SHA mismatches
+These are the keys placed under the arch-tagged artifacts dir (`artifacts_sm89/` shown; use `artifacts_sm86/` for
+an A10G target) — by `EPS_LOCAL=1` rsync (recommended) or by S3 download into your own bucket. The EPs are
+arch-agnostic, so the *same* files are staged regardless of `TARGET_CC`; only the AOTI compile output differs. Sizes below are from a validated artifact set. In S3 mode the script fail-closes on SHA mismatches
 for the required artifacts in `eps_manifest.json`; the small helper artifacts are SHA-verified when the manifest
 lists them. Note the EPs are large (~84 GiB total) — this is why they are regenerated/staged rather than committed.
 
