@@ -28,12 +28,14 @@ from typing import Iterable
 
 import torch
 
+from model_profile import get_profile, load_profile_model
 
-MODEL_ID = "nvidia/nemotron-speech-streaming-en-0.6b"
-SHIFT = 16
-PRE = 9
-DROP = 2
-MELS = 128
+PROFILE = get_profile()
+MODEL_ID = PROFILE.model_id
+SHIFT = PROFILE.shift
+PRE = PROFILE.pre
+DROP = PROFILE.drop
+MELS = PROFILE.mels
 EP_NAME = "enc_steady_t2a_b{b}.pt2"
 PKG_NAME = "enc_steady_aoti_b{b}.pt2"
 NAMES = ["enc_out", "enc_len", "cache_ch", "cache_t", "cache_ch_len"]
@@ -173,6 +175,9 @@ def emit_manifest(
         "CONTRACT": {
             "schema": 1,
             "model_id": MODEL_ID,
+            "profile": PROFILE.name,
+            "att_context_size": list(PROFILE.att_context),
+            "blank": PROFILE.blank,
             "shift": SHIFT,
             "pre_encode_cache": PRE,
             "drop_extra": DROP,
@@ -229,17 +234,11 @@ class SteadyStep(torch.nn.Module):
 
 def load_encoder():
     try:
-        import nemo.collections.asr as nemo_asr
+        import nemo.collections.asr  # noqa: F401
     except Exception as exc:
         raise RuntimeError("NeMo is required unless --compile-only is used") from exc
 
-    model = nemo_asr.models.ASRModel.from_pretrained(MODEL_ID, map_location="cpu").cuda().eval()
-    try:
-        model.preprocessor.featurizer.dither = 0.0
-    except Exception:
-        pass
-    model.encoder.set_default_att_context_size([70, 1])
-    return model.encoder
+    return load_profile_model(PROFILE).encoder
 
 
 def build_example(encoder, batch: int):

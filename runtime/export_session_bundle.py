@@ -47,7 +47,10 @@ from finalize_ref import (
     load_model,
     load_wav,
 )
+from model_profile import apply_prompt, get_profile, prompt_dictionary
 from ref_decode import ref_greedy_range
+
+PROFILE = get_profile()
 
 
 ART = os.path.join(os.path.dirname(__file__), "artifacts")
@@ -58,7 +61,7 @@ PREPROC_CI_REL_EPS = 1.0e-6
 PREPROC_CI_MEL_MAX_HEADROOM = 2.0
 PREPROC_CI_MEL_P99_HEADROOM = 16.0
 PREPROC_CI_CACHE_MAX_HEADROOM = 2.0
-MODEL_ID = "nvidia/nemotron-speech-streaming-en-0.6b"
+MODEL_ID = PROFILE.model_id
 PREPROC_MANIFEST_SCHEMA = 1
 
 
@@ -103,6 +106,28 @@ def _pack_utf8(strings: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
 
 def _sample_id_for(example: dict[str, Any], sample_index: int) -> str:
     return str(example.get("sample_id", sample_index))
+
+
+def _register_prompt_table(module: torch.nn.Module, prompt_dict: dict[str, int] | None) -> None:
+    """Pack the language -> prompt-index table for prompted (multilingual) models.
+
+    prompt_meta = [num_prompts, default_index]; non-prompted profiles pack an
+    empty table with prompt_meta = [0, -1] so the C++ loader can distinguish.
+    """
+    prompt_dict = prompt_dict or {}
+    langs = sorted(prompt_dict)
+    lang_bytes, lang_offsets = _pack_utf8(langs)
+    module.register_buffer("prompt_lang_bytes", lang_bytes)
+    module.register_buffer("prompt_lang_offsets", lang_offsets)
+    module.register_buffer(
+        "prompt_lang_indices",
+        torch.tensor([prompt_dict[k] for k in langs], dtype=torch.int64),
+    )
+    default_index = prompt_dict.get(PROFILE.default_target_lang, -1) if prompt_dict else -1
+    module.register_buffer(
+        "prompt_meta",
+        torch.tensor([int(PROFILE.num_prompts), int(default_index)], dtype=torch.int64),
+    )
 
 
 def _tokenizer_vocab_size(tokenizer: Any) -> int:
@@ -1092,7 +1117,7 @@ class RecordingContinuousFinalizeRef(ContinuousFinalizeRef):
     def _warm_stream_encoder_artifacts(self) -> None:
         warm = self.new_session("export-encoder-warmup")
         g = self.geometry
-        first_mel = torch.zeros((1, 128, int(g.shift_frames)), device=self.device)
+        first_mel = torch.zeros((1, PROFILE.mels, int(g.shift_frames)), device=self.device)
         first_len = torch.tensor([int(g.shift_frames)], device=self.device)
         first_out = self.enc_first(
             first_mel.contiguous(),
@@ -1102,7 +1127,7 @@ class RecordingContinuousFinalizeRef(ContinuousFinalizeRef):
             warm.cache_last_channel_len.contiguous(),
         )
         steady_mel = torch.zeros(
-            (1, 128, int(g.pre_encode_cache_size + g.shift_frames)),
+            (1, PROFILE.mels, int(g.pre_encode_cache_size + g.shift_frames)),
             device=self.device,
         )
         steady_len = torch.tensor([int(g.pre_encode_cache_size + g.shift_frames)], device=self.device)
@@ -1281,6 +1306,7 @@ class RecordingContinuousFinalizeRef(ContinuousFinalizeRef):
             chunk_mel,
             drop_extra,
         )
+        enc_out = apply_prompt(self.model, enc_out)
         tokens, decoder_state, pred_out = ref_greedy_range(
             self.decoder,
             self.joint,
@@ -1543,6 +1569,7 @@ class SessionBundle(torch.nn.Module):
         *,
         audio: bool = False,
         audio_ci: dict[str, Any] | None = None,
+        prompt_dict: dict[str, int] | None = None,
     ):
         super().__init__()
         init_h, init_c = _decoder_state_hc(init_session.decoder_state)
@@ -1582,6 +1609,7 @@ class SessionBundle(torch.nn.Module):
         self.register_buffer("detok_selftest_token_offsets", detok_token_offsets)
         self.register_buffer("detok_selftest_text_bytes", detok_text_bytes)
         self.register_buffer("detok_selftest_text_offsets", detok_text_offsets)
+        _register_prompt_table(self, prompt_dict)
 
         for i, row in enumerate(rows):
             prefix = f"utt{i}"
@@ -1658,6 +1686,7 @@ class MultiTurnSessionBundle(torch.nn.Module):
         *,
         audio: bool = False,
         audio_ci: dict[str, Any] | None = None,
+        prompt_dict: dict[str, int] | None = None,
     ):
         super().__init__()
         init_h, init_c = _decoder_state_hc(init_session.decoder_state)
@@ -1698,6 +1727,7 @@ class MultiTurnSessionBundle(torch.nn.Module):
         self.register_buffer("detok_selftest_token_offsets", detok_token_offsets)
         self.register_buffer("detok_selftest_text_bytes", detok_text_bytes)
         self.register_buffer("detok_selftest_text_offsets", detok_text_offsets)
+        _register_prompt_table(self, prompt_dict)
 
         for stream_i, stream in enumerate(streams):
             sprefix = f"stream{stream_i}"
@@ -2017,6 +2047,7 @@ def main() -> int:
                 detok_texts,
                 audio=args.audio,
                 audio_ci=audio_ci,
+                prompt_dict=prompt_dictionary(model),
             )
         )
         bundle.save(args.out)
@@ -2085,6 +2116,7 @@ def main() -> int:
             detok_texts,
             audio=args.audio,
             audio_ci=audio_ci,
+            prompt_dict=prompt_dictionary(model),
         )
     )
     bundle.save(args.out)

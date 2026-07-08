@@ -23,16 +23,8 @@ namespace fs = std::filesystem;
 
 class BatchedSteadyScheduler;
 
-static constexpr int BLANK = 1024;
-static constexpr int MAX_SYMBOLS = 10;
-static constexpr int SHIFT = 16;
-static constexpr int PRE = 9;
-static constexpr int DROP = 2;
-static constexpr int RIGHT_CONTEXT = 1;
-static constexpr int FINAL_PADDING_FRAMES = 32;
-static constexpr int ATT_CONTEXT_LEFT = 70;
-static constexpr int ATT_CONTEXT_RIGHT = 1;
-static constexpr const char* MODEL_ID = "nvidia/nemotron-speech-streaming-en-0.6b";
+#include "lib/session/model_constants.h"
+
 static constexpr double ARGMAX_MARGIN_WARNING_THRESHOLD = 1.0e-2;
 static constexpr double ARGMAX_MARGIN_UNSAFE_THRESHOLD = 1.0e-3;
 
@@ -66,6 +58,14 @@ struct Tokenizer {
   std::string ids_to_text(const std::vector<int64_t>& ids) const;
 };
 
+// Language -> prompt-index table shipped in the session bundle (prompted
+// profile only; empty with default_index=-1 for the en profile).
+struct PromptTable {
+  std::unordered_map<std::string, int64_t> lang_to_index;
+  int64_t num_prompts = 0;
+  int64_t default_index = -1;
+};
+
 struct SessionState {
   std::atomic<uint64_t> generation{0};
   torch::Tensor clc;
@@ -87,6 +87,13 @@ struct SessionState {
   SessionMode mode = SessionMode::STREAMING;
   int64_t total_audio_samples = 0;
   int64_t synthetic_prefix_samples = 0;
+  // Language-ID prompt conditioning (prompted profile only): device-resident
+  // [1, NUM_PROMPTS] one-hot applied to every encoder output before decode.
+  // Persists across finalize forks and cold resets.
+  torch::Tensor prompt;
+  int64_t prompt_index = -1;
+  std::string language;       // resolved locale for this session ("auto", "es-ES", ...)
+  std::string last_language;  // last complete <xx-XX> tag observed in the hypothesis
 
   SessionState() = default;
 
@@ -116,6 +123,10 @@ struct SessionState {
     mode = other.mode;
     total_audio_samples = other.total_audio_samples;
     synthetic_prefix_samples = other.synthetic_prefix_samples;
+    prompt = other.prompt;
+    prompt_index = other.prompt_index;
+    language = other.language;
+    last_language = other.last_language;
     return *this;
   }
 
@@ -145,6 +156,10 @@ struct SessionState {
     mode = other.mode;
     total_audio_samples = other.total_audio_samples;
     synthetic_prefix_samples = other.synthetic_prefix_samples;
+    prompt = std::move(other.prompt);
+    prompt_index = other.prompt_index;
+    language = std::move(other.language);
+    last_language = std::move(other.last_language);
     return *this;
   }
 };
@@ -300,6 +315,18 @@ std::string append_only_delta_text(const std::string& final_text,
 std::string append_delta_to_collector(const std::string& collector, const std::string& delta);
 Tokenizer tokenizer_from_bundle(torch::jit::Module& bundle);
 void verify_tokenizer_selftest(torch::jit::Module& bundle, const Tokenizer& tokenizer);
+// Language-ID prompt conditioning (prompted profile; all no-ops/identity for en).
+torch::Tensor make_prompt_onehot(int64_t index, torch::Device device);
+PromptTable prompt_table_from_bundle(torch::jit::Module& bundle);
+void initialize_prompt_runtime(const std::string& artifact_dir,
+                               torch::jit::Module& bundle,
+                               torch::Device device);
+bool prompt_runtime_initialized();
+const PromptTable& prompt_runtime_table();
+torch::Tensor condition_encoder_output(const torch::Tensor& enc_out, const SessionState& state);
+// Wire-layer language-tag handling (mirrors server.py LANG_TAG_RE and friends).
+std::string strip_lang_tags_text(const std::string& text);
+std::string last_lang_tag(const std::string& text);
 std::vector<EmittedEvent> gold_events_from_bundle(torch::jit::Module& bundle, int utt);
 void emit_event(std::vector<EmittedEvent>& events,
                 int64_t kind,

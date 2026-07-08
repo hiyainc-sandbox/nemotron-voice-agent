@@ -41,6 +41,13 @@ cd runtime    # from the repo root
 ./container/enter.sh cmake --build cpp/build_step10 --target ws_server density_main ws_framing_selftest -j8
 ```
 
+To serve the **multilingual** model (`nvidia/nemotron-3.5-asr-streaming-0.6b`) instead, configure a
+separate build tree with `-DNEMOTRON_PROFILE=ml` (one model per binary; see
+`cpp/lib/session/model_constants.h` and `ARTIFACTS.md` §"Model profiles") and point it at
+`ml`-profile artifacts (e.g. `artifacts_ml/`). The ml server accepts `?language=<locale>` (any key
+of the model's prompt dictionary) or `?language=auto` per connection, and transcript events carry a
+`language` field.
+
 Produces `cpp/build_step10/ws_server`. (The oracle's default path is `cpp/build/ws_server`; this
 runbook uses `build_step10`, the dir built in the scheduler-integration work.)
 

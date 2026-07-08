@@ -31,6 +31,7 @@ import torch
 from omegaconf import OmegaConf
 
 import nemo.collections.asr as nemo_asr
+from model_profile import apply_prompt, get_profile, load_profile_model
 from ref_decode import ref_greedy, ref_greedy_range
 
 
@@ -38,10 +39,11 @@ STREAMING = "STREAMING"
 PENDING_FINALIZE = "PENDING_FINALIZE"
 FINALIZED = "FINALIZED"
 
-BLANK = 1024
-MAX_SYMBOLS = 10
+PROFILE = get_profile()
+BLANK = PROFILE.blank
+MAX_SYMBOLS = PROFILE.max_symbols
 FINALIZE_SILENCE_MS = 150
-RIGHT_CONTEXT = 1
+RIGHT_CONTEXT = PROFILE.right_context
 CANARY_INDICES = (4, 9, 2, 3)
 
 
@@ -178,15 +180,7 @@ def _load_normalizer():
 
 
 def load_model():
-    model = nemo_asr.models.ASRModel.from_pretrained(
-        "nvidia/nemotron-speech-streaming-en-0.6b",
-        map_location="cpu",
-    ).cuda().eval()
-    try:
-        model.preprocessor.featurizer.dither = 0.0
-    except Exception:
-        pass
-    model.encoder.set_default_att_context_size([70, 1])
+    model = load_profile_model(PROFILE)
     model.change_decoding_strategy(
         decoding_cfg=OmegaConf.create(
             {
@@ -570,6 +564,7 @@ class ContinuousFinalizeRef:
             keep_all_outputs=False,
             drop_extra_pre_encoded=drop_extra,
         )
+        enc_out = apply_prompt(self.model, enc_out)
         tokens, decoder_state, pred_out = ref_greedy_range(
             self.decoder,
             self.joint,
@@ -785,6 +780,7 @@ class ContinuousFinalizeRef:
             keep_all_outputs=True,
             drop_extra_pre_encoded=inputs.drop_extra,
         )
+        enc_out = apply_prompt(self.model, enc_out)
         tokens, decoder_state, pred_out = ref_greedy_range(
             self.decoder,
             self.joint,
@@ -864,6 +860,7 @@ class ContinuousFinalizeRef:
             keep_all_outputs=False,
             drop_extra_pre_encoded=drop_extra,
         )
+        enc_out = apply_prompt(self.model, enc_out)
         hypotheses = self.model.decoding.rnnt_decoder_predictions_tensor(
             enc_out,
             enc_len,
@@ -926,6 +923,7 @@ class ContinuousFinalizeRef:
                 keep_all_outputs=True,
                 drop_extra_pre_encoded=inputs.drop_extra,
             )
+            enc_out = apply_prompt(self.model, enc_out)
             partial_hypotheses = self.model.decoding.rnnt_decoder_predictions_tensor(
                 enc_out,
                 enc_len,
@@ -1046,10 +1044,12 @@ class ContinuousFinalizeRef:
     def offline_full_greedy_tokens(self, wav: np.ndarray) -> list[int]:
         audio = torch.tensor(wav, dtype=torch.float32, device=self.device).unsqueeze(0)
         audio_len = torch.tensor([wav.shape[0]], dtype=torch.long, device=self.device)
-        enc, enc_len = self.model.forward(
-            input_signal=audio,
-            input_signal_length=audio_len,
-        )
+        # Run preprocessor+encoder directly (prompted models require
+        # prompt_indices through model.forward; the inference-prompt path is
+        # the post-encoder apply_prompt hook instead).
+        proc, proc_len = self.model.preprocessor(input_signal=audio, length=audio_len)
+        enc, enc_len = self.encoder(audio_signal=proc, length=proc_len)
+        enc = apply_prompt(self.model, enc)
         return ref_greedy(self.decoder, self.joint, enc, enc_len)
 
     def text(self, tokens: list[int]) -> str:

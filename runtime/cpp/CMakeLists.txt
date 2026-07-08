@@ -5,6 +5,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+# Model profile: one model per binary (see lib/session/model_constants.h and
+# runtime/model_profile.py). "en" (default) = nemotron-speech-streaming-en-0.6b;
+# "ml" = nemotron-3.5-asr-streaming-0.6b (multilingual, language-ID prompted).
+set(NEMOTRON_PROFILE "en" CACHE STRING "Model profile to compile for (en|ml)")
+if(NEMOTRON_PROFILE STREQUAL "ml")
+  add_compile_definitions(NEMOTRON_PROFILE_ML)
+elseif(NOT NEMOTRON_PROFILE STREQUAL "en")
+  message(FATAL_ERROR "NEMOTRON_PROFILE must be en or ml, got: ${NEMOTRON_PROFILE}")
+endif()
+message(STATUS "NEMOTRON_PROFILE=${NEMOTRON_PROFILE}")
+
 # Step 3a: standalone localhost WebSocket tail-latency microbench. Keep this
 # target independent from Torch/CUDA so it can be built as a bounded local tool.
 add_executable(ws_tail_microbench ws_tail_microbench.cpp)

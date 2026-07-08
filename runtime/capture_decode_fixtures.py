@@ -14,7 +14,9 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-MODEL = "nvidia/nemotron-speech-streaming-en-0.6b"
+from model_profile import apply_prompt, get_profile, load_profile_model
+
+PROFILE = get_profile()
 
 def describe(x, name):
     if torch.is_tensor(x): return f"{name}: Tensor {tuple(x.shape)} {x.dtype} {x.device}"
@@ -22,15 +24,14 @@ def describe(x, name):
     return f"{name}: {type(x).__name__}={x!r}" if not hasattr(x,'__dict__') else f"{name}: {type(x).__name__} fields={list(vars(x).keys())}"
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument("--out",default="./fixtures"); a=ap.parse_args()
+    ap=argparse.ArgumentParser(); ap.add_argument("--out",default=f"./{PROFILE.fixtures_dirname}")
+    ap.add_argument("--wav", nargs="*", default=[], help="16 kHz wav files captured as decode_real_N fixtures")
+    a=ap.parse_args()
     os.makedirs(a.out,exist_ok=True)
-    import nemo.collections.asr as nemo_asr
-    model = nemo_asr.models.ASRModel.from_pretrained(MODEL, map_location="cpu").cuda().eval()
-    try: model.preprocessor.featurizer.dither = 0.0
-    except Exception: pass
+    model = load_profile_model(PROFILE)
     # Deployed decode config.
     cfg = OmegaConf.create({"strategy":"greedy_batch",
-                            "greedy":{"max_symbols":10,"loop_labels":True,"use_cuda_graph_decoder":False}})
+                            "greedy":{"max_symbols":PROFILE.max_symbols,"loop_labels":True,"use_cuda_graph_decoder":False}})
     model.change_decoding_strategy(decoding_cfg=cfg)
     print("decoding:", type(model.decoding).__name__,
           "infer:", type(getattr(model.decoding,'decoding',None)).__name__)
@@ -39,6 +40,13 @@ def main():
     cases = {"noise_3s": rng.standard_normal(48000).astype(np.float32)*0.05,
              "noise_loud_3s": rng.standard_normal(48000).astype(np.float32)*0.3,
              "quiet_1s": rng.standard_normal(16000).astype(np.float32)*0.005}
+    if a.wav:
+        import soundfile as sf
+        for i, wav_path in enumerate(a.wav):
+            audio, sr = sf.read(wav_path, dtype="float32")
+            if audio.ndim > 1: audio = audio[:, 0]
+            assert sr == 16000, f"{wav_path}: expected 16 kHz, got {sr}"
+            cases[f"real_{i}"] = np.ascontiguousarray(audio)
     manifest={}
     for name, audio in cases.items():
         sig = torch.tensor(audio, device="cuda").unsqueeze(0)
@@ -46,6 +54,7 @@ def main():
         with torch.inference_mode():
             proc, proc_len = model.preprocessor(input_signal=sig, length=length)
             enc, enc_len = model.encoder(audio_signal=proc, length=proc_len)   # [B, D, T]
+            enc = apply_prompt(model, enc)
             hyps = model.decoding.rnnt_decoder_predictions_tensor(enc, enc_len, return_hypotheses=True)
         h = hyps[0]
         if name=="noise_3s":

@@ -1225,6 +1225,11 @@ std::string wire_event_json(const WireEvent& event) {
     oss << ",\"finalize_timing\":" << event.finalize_timing->dump();
   }
   if (event.message.has_value()) oss << ",\"message\":" << json_quote(*event.message);
+  if (event.language.has_value()) {
+    // Mirror the Python server payload, which carries both keys.
+    oss << ",\"language\":" << json_quote(*event.language)
+        << ",\"language_tag\":" << json_quote(*event.language);
+  }
   oss << "}";
   return oss.str();
 }
@@ -1365,7 +1370,22 @@ std::optional<std::string> validate_ws_query(const ws_routes::Route& route,
   std::string language =
       language_it == route.query_params.end() ? std::string() : trim_ascii(language_it->second);
   if (!language.empty()) {
-    return "this model does not accept a language argument";
+    if (!MODEL_PROMPTED) {
+      return "this model does not accept a language argument";
+    }
+    const PromptTable& table = prompt_runtime_table();
+    if (table.lang_to_index.find(language) == table.lang_to_index.end()) {
+      std::vector<std::string> supported;
+      supported.reserve(table.lang_to_index.size());
+      for (const auto& kv : table.lang_to_index) supported.push_back(kv.first);
+      std::sort(supported.begin(), supported.end());
+      std::string joined;
+      for (const auto& lang : supported) {
+        if (!joined.empty()) joined += ", ";
+        joined += lang;
+      }
+      return "unsupported language " + language + "; supported: " + joined;
+    }
   }
   return std::nullopt;
 }
@@ -1645,6 +1665,12 @@ void ws_worker(int fd, std::shared_ptr<ServerState> state, ws_routes::Route rout
   session_cfg.active_sessions_at_emit =
       static_cast<int>(state->admission->telemetry_snapshot().active_count);
   session_cfg.label = stream_id;
+  if (MODEL_PROMPTED) {
+    auto language_it = route.query_params.find("language");
+    if (language_it != route.query_params.end()) {
+      session_cfg.language = trim_ascii(language_it->second);
+    }
+  }
   SessionRuntime session(*state->shared_runtime, session_cfg);
   active = register_session(state, stream_id, conn.get());
 

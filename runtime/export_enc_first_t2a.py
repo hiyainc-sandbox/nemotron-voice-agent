@@ -21,11 +21,15 @@ from omegaconf import OmegaConf
 
 import nemo.collections.asr as nemo_asr
 
+from model_profile import get_profile, load_profile_model
+
 
 class FirstChunkStep(torch.nn.Module):
-    def __init__(self, encoder):
+    def __init__(self, encoder, valid_out: int, extra_out: int):
         super().__init__()
         self.encoder = encoder
+        self.valid_out = valid_out
+        self.extra_out = extra_out
 
     def forward(self, chunk, length, cache_last_channel, cache_last_time, cache_last_channel_len):
         enc_out, enc_len, cache_ch, cache_t, cache_ch_len = self.encoder.cache_aware_stream_step(
@@ -37,12 +41,20 @@ class FirstChunkStep(torch.nn.Module):
             keep_all_outputs=True,
             drop_extra_pre_encoded=0,
         )
-        # For the first 16-frame chunk, keep_all_outputs=True returns one extra
-        # encoder frame at the end; the prefix and recurrent caches are
+        # For the first shift-frame chunk, keep_all_outputs=True returns
+        # extra encoder frames at the end; the prefix and recurrent caches are
         # byte-exact to keep_all_outputs=False in eager/TS.  Returning the
         # prefix keeps the runtime contract unchanged while giving AOTI the
-        # numerically safer graph used by finalize-style exports.
-        return enc_out[:, :, :2].contiguous(), enc_len - 1, cache_ch, cache_t, cache_ch_len
+        # numerically safer graph used by finalize-style exports.  valid_out /
+        # extra_out are measured eagerly against keep_all_outputs=False before
+        # export (2 / 1 for the en profile at shift 16).
+        return (
+            enc_out[:, :, : self.valid_out].contiguous(),
+            enc_len - self.extra_out,
+            cache_ch,
+            cache_t,
+            cache_ch_len,
+        )
 
 
 def _stream_cfg_int(value) -> int:
@@ -74,20 +86,14 @@ def main() -> int:
     args = parser.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    model = nemo_asr.models.ASRModel.from_pretrained(
-        "nvidia/nemotron-speech-streaming-en-0.6b", map_location="cpu"
-    ).cuda().eval()
-    try:
-        model.preprocessor.featurizer.dither = 0.0
-    except Exception:
-        pass
-    model.encoder.set_default_att_context_size([70, 1])
+    profile = get_profile()
+    model = load_profile_model(profile)
     model.change_decoding_strategy(
         decoding_cfg=OmegaConf.create(
             {
                 "strategy": "greedy_batch",
                 "greedy": {
-                    "max_symbols": 10,
+                    "max_symbols": profile.max_symbols,
                     "loop_labels": True,
                     "use_cuda_graph_decoder": False,
                 },
@@ -113,7 +119,35 @@ def main() -> int:
     clc = cache[0].clone()
     clt = cache[1].clone()
     clcl = cache[2].clone()
-    step = FirstChunkStep(encoder).cuda().eval()
+
+    # Measure the valid first-chunk output length (keep_all_outputs=False) and
+    # how many extra frames keep_all_outputs=True appends; those become static
+    # slice constants in the exported graph.
+    with torch.inference_mode():
+        ref_valid = encoder.cache_aware_stream_step(
+            processed_signal=chunk,
+            processed_signal_length=length,
+            cache_last_channel=clc.clone(),
+            cache_last_time=clt.clone(),
+            cache_last_channel_len=clcl.clone(),
+            keep_all_outputs=False,
+            drop_extra_pre_encoded=0,
+        )
+        ref_all = encoder.cache_aware_stream_step(
+            processed_signal=chunk,
+            processed_signal_length=length,
+            cache_last_channel=clc.clone(),
+            cache_last_time=clt.clone(),
+            cache_last_channel_len=clcl.clone(),
+            keep_all_outputs=True,
+            drop_extra_pre_encoded=0,
+        )
+    valid_out = int(ref_valid[1][0])
+    extra_out = int(ref_all[1][0]) - valid_out
+    if extra_out < 0:
+        raise RuntimeError(f"keep_all_outputs shrank the output: valid={valid_out} all={int(ref_all[1][0])}")
+    print(f"first-chunk geometry: valid_out={valid_out} extra_out={extra_out}")
+    step = FirstChunkStep(encoder, valid_out, extra_out).cuda().eval()
 
     with torch.inference_mode():
         eager = step(chunk, length, clc, clt, clcl)
@@ -158,6 +192,10 @@ def main() -> int:
                 "pre_encode_cache": pre,
                 "drop_extra_steady": drop,
                 "drop_extra_first": 0,
+                "valid_out": valid_out,
+                "extra_out": extra_out,
+                "model_id": profile.model_id,
+                "att_context_size": list(profile.att_context),
             },
         },
         io_path,

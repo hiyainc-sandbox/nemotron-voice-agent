@@ -6,7 +6,9 @@ the compiled artifact is byte-exact vs the eager reference (t2a_io.pt). Containe
 from __future__ import annotations
 import os, torch
 
-ART = os.path.join(os.path.dirname(__file__), "artifacts")
+ART = os.environ.get(
+    "NEMOTRON_ART_DIR", os.path.join(os.path.dirname(__file__), "artifacts")
+)
 
 def _force_noexecstack_on_link():
     """Fix the BUILD (not the binary): the AOTI wrapper.so links an input (embedded constants/cubin blob) without a

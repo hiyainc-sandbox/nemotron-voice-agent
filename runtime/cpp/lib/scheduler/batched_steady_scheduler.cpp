@@ -1,5 +1,7 @@
 #include "lib/scheduler/batched_steady_scheduler.h"
 
+#include "lib/session/model_constants.h"
+
 #include <torch/torch.h>
 
 #include <algorithm>
@@ -635,8 +637,8 @@ void BatchedSteadyScheduler::warmup_buckets() {
     for (int bucket : required_buckets()) {
       std::vector<BatchedSteadyInput> ready;
       ready.reserve(static_cast<size_t>(bucket));
-      auto chunk = torch::zeros({1, 128, 25}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
-      auto cache_ch = torch::zeros({24, 1, 70, 1024}, chunk.options());
+      auto chunk = torch::zeros({1, 128, PRE + SHIFT}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+      auto cache_ch = torch::zeros({24, 1, ATT_CONTEXT_LEFT, 1024}, chunk.options());
       auto cache_t = torch::zeros({24, 1, 1024, 8}, chunk.options());
       auto cache_ch_len = torch::zeros({1}, torch::TensorOptions().dtype(torch::kLong).device(device_));
       for (int row = 0; row < bucket; ++row) {
@@ -1528,8 +1530,8 @@ void BatchedSteadyScheduler::initialize_graph_runtime() {
       continue;
     }
     try {
-      auto chunk = torch::zeros({1, 128, 25}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
-      auto cache_ch = torch::zeros({24, 1, 70, 1024}, chunk.options());
+      auto chunk = torch::zeros({1, 128, PRE + SHIFT}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+      auto cache_ch = torch::zeros({24, 1, ATT_CONTEXT_LEFT, 1024}, chunk.options());
       auto cache_t = torch::zeros({24, 1, 1024, 8}, chunk.options());
       auto cache_ch_len = torch::full({1}, 3, torch::TensorOptions().dtype(torch::kLong).device(device_));
       std::vector<BatchedSteadyInput> ready;

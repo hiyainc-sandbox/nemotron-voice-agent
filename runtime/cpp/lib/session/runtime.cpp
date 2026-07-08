@@ -724,17 +724,42 @@ std::optional<WarmupInput> make_fixture_warmup_input(torch::jit::Module& bundle)
   }
 }
 
+// Wire-layer language projection for the prompted (multilingual) profile:
+// session-layer event text stays raw (byte-exact vs the Python oracle), the
+// wire strips <xx-XX> tags and carries the resolved language, mirroring
+// server.py::_transcript_payload. Identity for the en profile.
+void project_language(WireEvent& wire, const std::string& raw_text, SessionState& state) {
+  if (!MODEL_PROMPTED) {
+    wire.text = raw_text;
+    return;
+  }
+  std::string lang = last_lang_tag(raw_text);
+  if (!lang.empty()) state.last_language = lang;
+  wire.text = strip_lang_tags_text(raw_text);
+  const std::string& tag = !lang.empty()
+                               ? lang
+                               : (!state.last_language.empty() ? state.last_language : state.language);
+  if (!tag.empty()) wire.language = tag;
+}
+
 std::vector<WireEvent> project_events(const std::vector<EmittedEvent>& events,
-                                      const std::optional<SessionTiming>& final_timing) {
+                                      const std::optional<SessionTiming>& final_timing,
+                                      SessionState& state,
+                                      std::string& last_wire_interim_text) {
   std::vector<WireEvent> out;
   out.reserve(events.size());
   for (const auto& event : events) {
     if (event.kind == EVENT_SUPPRESSED) continue;
     WireEvent wire;
     wire.type = "transcript";
-    wire.text = event.text;
+    project_language(wire, event.text, state);
     if (event.kind == EVENT_INTERIM) {
       wire.is_final = false;
+      if (MODEL_PROMPTED) {
+        // A tag-only hypothesis change must not surface as a duplicate interim.
+        if (wire.text.value_or("") == last_wire_interim_text) continue;
+        last_wire_interim_text = wire.text.value_or("");
+      }
     } else if (event.kind == EVENT_FINAL) {
       wire.is_final = true;
       wire.finalize = true;
@@ -841,6 +866,7 @@ struct SharedRuntime::Impl {
     verify_session_bundle_meta(bundle, false);
     tokenizer_value = tokenizer_from_bundle(bundle);
     if (cfg.verify_tokenizer) verify_tokenizer_selftest(bundle, tokenizer_value);
+    initialize_prompt_runtime(artifact_dir, bundle, device);
 
     audio_geometry = session_runtime_audio_geometry_from_bundle(bundle);
     std::string preproc_path = (fs::path(artifact_dir) / "preproc.ts").string();
@@ -1659,6 +1685,25 @@ struct SessionRuntime::Impl {
         c10::cuda::CUDAGuard device_guard(s.device.index());
         c10::cuda::CUDAStreamGuard stream_guard(lane.stream());
         reset_session(state, s.bundle, s.device);
+        if (MODEL_PROMPTED) {
+          const PromptTable& table = prompt_runtime_table();
+          int64_t index = table.default_index;
+          std::string resolved = cfg.language;
+          if (!resolved.empty()) {
+            auto it = table.lang_to_index.find(resolved);
+            if (it == table.lang_to_index.end()) {
+              throw std::runtime_error("unsupported language for prompted model: " + resolved);
+            }
+            index = it->second;
+          } else {
+            for (const auto& kv : table.lang_to_index) {
+              if (kv.second == index) { resolved = kv.first; break; }
+            }
+          }
+          state.prompt = make_prompt_onehot(index, s.device);
+          state.prompt_index = index;
+          state.language = resolved;
+        }
         audio = make_session_runtime_audio_frontend(s.bundle, lane.preproc(), s.device);
         reset_session_runtime_audio_front(state, *audio);
         lane.synchronize();
@@ -1740,7 +1785,7 @@ struct SessionRuntime::Impl {
     }, &lane_queue_wait_ms);
     steady_timing.add(local_steady_timing, lane_queue_wait_ms);
     debug_events.insert(debug_events.end(), events.begin(), events.end());
-    return project_events(events, std::nullopt);
+    return project_events(events, std::nullopt, state, last_wire_interim_text);
   }
 
   void vad_start() {
@@ -1816,10 +1861,10 @@ struct SessionRuntime::Impl {
     return finalize_and_idle("debounce_expired", FinalizeFinish::SPECULATIVE_KEEP);
   }
 
-  std::vector<WireEvent> soft_final(bool finalize_flag) const {
+  std::vector<WireEvent> soft_final(bool finalize_flag) {
     WireEvent wire;
     wire.type = "transcript";
-    wire.text = shared.impl_->tokenizer_value.ids_to_text(state.hyp);
+    project_language(wire, shared.impl_->tokenizer_value.ids_to_text(state.hyp), state);
     wire.is_final = true;
     wire.finalize = finalize_flag;
     return {std::move(wire)};
@@ -1875,7 +1920,24 @@ struct SessionRuntime::Impl {
 
     // SessionRuntime leaves stats emission to the WS worker, which owns the stale-generation
     // send/drop decision and records last_timing() after that emit decision.
-    return project_events(events, timing);
+    auto wire = project_events(events, timing, state, last_wire_interim_text);
+    // A finalize must always answer with a final on the wire (the Python
+    // reference server does), even when the session suppressed the event
+    // because the append-only delta was empty — e.g. a zero-token utterance.
+    // Otherwise a client waiting on vad_stop -> is_final hangs.
+    bool has_wire_final = std::any_of(wire.begin(), wire.end(), [](const WireEvent& event) {
+      return event.is_final.value_or(false);
+    });
+    if (!has_wire_final) {
+      WireEvent finale;
+      finale.type = "transcript";
+      project_language(finale, s.tokenizer_value.ids_to_text(state.hyp), state);
+      finale.is_final = true;
+      finale.finalize = true;
+      finale.finalize_timing = timing.to_wire_json();
+      wire.push_back(std::move(finale));
+    }
+    return wire;
   }
 
   std::vector<WireEvent> finalize_and_idle(const std::string& reason, FinalizeFinish finish) {
@@ -1894,6 +1956,9 @@ struct SessionRuntime::Impl {
   int finalize_silence_ms = 0;
   LaneLease lane_lease;
   SessionState state;
+  // Last interim text emitted on the wire post tag-stripping (prompted-profile
+  // interim dedup; unused for en).
+  std::string last_wire_interim_text;
   RuntimeAudioFrontendPtr audio;
   VadState vad_state = VadState::IDLE;
   std::optional<double> vad_deadline_ts;

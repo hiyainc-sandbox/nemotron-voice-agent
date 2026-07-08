@@ -182,8 +182,8 @@ static inline BucketConstants constants_for_bucket(
 }  // namespace bsteady_detail
 
 struct BatchedSteadyInput {
-  torch::Tensor chunk;       // [1, 128, 25]
-  torch::Tensor cache_ch;    // [24, 1, 70, 1024]
+  torch::Tensor chunk;       // [1, 128, PRE+SHIFT]
+  torch::Tensor cache_ch;    // [24, 1, ATT_CONTEXT_LEFT, 1024]
   torch::Tensor cache_t;     // [24, 1, 1024, 8]
   torch::Tensor cache_ch_len;  // [1]
   std::string label;

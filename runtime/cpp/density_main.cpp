@@ -1373,6 +1373,7 @@ static std::unique_ptr<WorkerContext> make_worker_context(const std::string& dir
                                                           std::shared_ptr<torch::jit::Module> shared_bundle,
                                                           std::shared_ptr<SharedEncFirst> enc_first = nullptr) {
   if (!shared_bundle) throw std::runtime_error("make_worker_context requires a shared session bundle");
+  initialize_prompt_runtime(dir, *shared_bundle, device);  // idempotent; no-op for the en profile
   if (!enc_first) {
     enc_first = load_shared_enc_first(dir, device, "per_worker_context_own_enc_first");
   }
@@ -7364,8 +7365,8 @@ static BatchedSteadyInput make_scheduler_admission_input(torch::Device device, c
   auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
   auto long_options = torch::TensorOptions().dtype(torch::kLong).device(device);
   return {
-      torch::zeros({1, 128, 25}, float_options),
-      torch::zeros({24, 1, 70, 1024}, float_options),
+      torch::zeros({1, 128, PRE + SHIFT}, float_options),
+      torch::zeros({24, 1, ATT_CONTEXT_LEFT, 1024}, float_options),
       torch::zeros({24, 1, 1024, 8}, float_options),
       torch::zeros({1}, long_options),
       label,
@@ -7940,8 +7941,8 @@ static BatchedSteadyInput make_scheduler_stress_input(torch::Device device,
   auto long_options = torch::TensorOptions().dtype(torch::kLong).device(device);
   float value = static_cast<float>((seed % 251) + 1) * 0.0005f;
   return {
-      torch::full({1, 128, 25}, value, float_options),
-      torch::zeros({24, 1, 70, 1024}, float_options),
+      torch::full({1, 128, PRE + SHIFT}, value, float_options),
+      torch::zeros({24, 1, ATT_CONTEXT_LEFT, 1024}, float_options),
       torch::zeros({24, 1, 1024, 8}, float_options),
       torch::zeros({1}, long_options),
       label,
