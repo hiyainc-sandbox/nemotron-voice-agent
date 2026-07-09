@@ -184,6 +184,13 @@ drains in-flight sessions). If backgrounded, `kill <pid>` (SIGINT/SIGTERM → gr
 PORT=8081 CAP=64 FINALIZE_RUNNERS=2 bash start_ws_server_local.sh
 ```
 
+`PROFILE=ml` serves the multilingual model instead — it defaults `BUILD_DIR` to `cpp/build_l40s_ml`
+and the artifact/steady-batch dirs to `artifacts_ml/` (each individually overridable):
+
+```bash
+PROFILE=ml bash start_ws_server_local.sh
+```
+
 ---
 
 ## Troubleshooting
