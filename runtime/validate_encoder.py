@@ -7,10 +7,10 @@ Run: ./.venv/bin/python validate_encoder.py
 from __future__ import annotations
 import os, torch
 import nemo.collections.asr as nemo_asr
+from model_profile import get_profile, load_profile_model
 
 def main():
-    model = nemo_asr.models.ASRModel.from_pretrained(
-        "nvidia/nemotron-speech-streaming-en-0.6b", map_location="cpu").cuda().eval()
+    model = load_profile_model(get_profile())
     enc = model.encoder
     scfg = enc.streaming_cfg
     def _int(v): return int(v[1]) if isinstance(v,(list,tuple)) else int(v)

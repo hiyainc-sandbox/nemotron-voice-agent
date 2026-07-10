@@ -8,7 +8,9 @@ import os
 
 import torch
 
+from model_profile import get_profile
 
+PROFILE = get_profile()
 ART = os.path.join(os.path.dirname(__file__), "artifacts")
 
 
@@ -24,7 +26,10 @@ class FinalizeBundle(torch.nn.Module):
         self.register_buffer("num_rows", torch.tensor([len(rows)], dtype=torch.int64))
         self.register_buffer(
             "meta",
-            torch.tensor([len(rows), 1024, 10, 16, 9, 2], dtype=torch.int64),
+            torch.tensor(
+                [len(rows), PROFILE.blank, PROFILE.max_symbols, PROFILE.shift, PROFILE.pre, PROFILE.drop],
+                dtype=torch.int64,
+            ),
         )
 
         for i, row in enumerate(rows):
@@ -81,11 +86,16 @@ class FinalizeBundle(torch.nn.Module):
 
 
 def main() -> int:
-    fixture_path = os.path.join(ART, "finalize_fixture.pt")
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--art", default=ART, help="artifact directory (default: artifacts)")
+    args = parser.parse_args()
+    fixture_path = os.path.join(args.art, "finalize_fixture.pt")
     fixture = torch.load(fixture_path, weights_only=False)
     rows = fixture["rows"]
     bundle = torch.jit.script(FinalizeBundle(rows))
-    out_path = os.path.join(ART, "finalize_bundle.ts")
+    out_path = os.path.join(args.art, "finalize_bundle.ts")
     bundle.save(out_path)
     print(f"wrote {out_path} ({len(rows)} finalize rows)")
     for i, row in enumerate(rows):

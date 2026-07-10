@@ -19,7 +19,9 @@ import torch
 from whisper_normalizer.english import EnglishTextNormalizer
 
 
-ART = os.path.join(os.path.dirname(__file__), "artifacts")
+ART = os.environ.get(
+    "NEMOTRON_ART_DIR", os.path.join(os.path.dirname(__file__), "artifacts")
+)
 
 
 def _package_version(*names: str) -> str:

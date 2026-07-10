@@ -70,13 +70,16 @@ def main():
         action="store_true",
         help="compatibility-only: rewrite an existing .pt to encoder.* keys without reloading the model",
     )
+    parser.add_argument("--out", default=ART, help="artifact directory (default: artifacts)")
     args = parser.parse_args()
 
-    os.makedirs(ART, exist_ok=True)
+    out_pt = os.path.join(args.out, "finalize_shared_weights.pt")
+    out_ts = os.path.join(args.out, "finalize_shared_weights.ts")
+    os.makedirs(args.out, exist_ok=True)
     cmap = build_cmap(reuse_existing=args.reuse_existing)
-    torch.save(cmap, PT)
+    torch.save(cmap, out_pt)
     sm = torch.jit.script(SharedWeights(dict(cmap)))
-    sm.save(TS)
+    sm.save(out_ts)
     encoder_keys = sum(1 for key in cmap if key.startswith("encoder."))
     e_keys = sum(1 for key in cmap if key.startswith("e."))
     print(

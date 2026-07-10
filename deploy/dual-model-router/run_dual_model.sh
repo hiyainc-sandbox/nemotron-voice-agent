@@ -15,7 +15,7 @@ ML_PY="${ML_PY:?set ML_PY to the python in the EA-NeMo venv (multilingual backen
 ROUTER_PY="${ROUTER_PY:-$EN_PY}"   # any python with the `websockets` package
 
 EN_MODEL="${EN_MODEL:-nvidia/nemotron-speech-streaming-en-0.6b}"
-ML_MODEL="${ML_MODEL:?set ML_MODEL to the multilingual .nemo path or HF id (e.g. nvidia/NVIDIA-Nemotron-3.5-ASR-Streaming-Multilingual-0.6b)}"
+ML_MODEL="${ML_MODEL:?set ML_MODEL to the multilingual .nemo path or HF id (e.g. nvidia/nemotron-3.5-asr-streaming-0.6b)}"
 
 EN_PORT="${EN_PORT:-8081}"; ML_PORT="${ML_PORT:-8082}"; ROUTER_PORT="${ROUTER_PORT:-8080}"
 

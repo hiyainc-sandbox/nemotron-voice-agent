@@ -36,6 +36,9 @@ struct WireEvent {
   std::optional<bool> finalize;
   std::optional<nlohmann::json> finalize_timing;
   std::optional<std::string> message;
+  // Prompted (multilingual) profile: resolved language for this transcript —
+  // the last complete <xx-XX> tag observed, else the session's target language.
+  std::optional<std::string> language;
 };
 
 struct SharedRuntimeConfig {
@@ -72,6 +75,10 @@ struct SessionConfig {
   int active_sessions_at_emit = 0;
   std::string label = "session";
   bool gil_attrib_enabled = false;
+  // Prompted (multilingual) profile: resolved per-connection language. Must be
+  // a key of the bundle's prompt table (e.g. "es-ES" or "auto"); empty selects
+  // the bundle default.
+  std::string language;
 };
 
 enum class VadState { IDLE, SPEAKING, PENDING_FINALIZE };

@@ -48,16 +48,8 @@
 using torch::inductor::AOTIModelPackageLoader;
 namespace fs = std::filesystem;
 
-static constexpr int BLANK = 1024;
-static constexpr int MAX_SYMBOLS = 10;
-static constexpr int SHIFT = 16;
-static constexpr int PRE = 9;
-static constexpr int DROP = 2;
-static constexpr int RIGHT_CONTEXT = 1;
-static constexpr int FINAL_PADDING_FRAMES = 32;
-static constexpr int ATT_CONTEXT_LEFT = 70;
-static constexpr int ATT_CONTEXT_RIGHT = 1;
-static constexpr const char* MODEL_ID = "nvidia/nemotron-speech-streaming-en-0.6b";
+#include "lib/session/model_constants.h"
+
 static constexpr double ARGMAX_MARGIN_WARNING_THRESHOLD = 1.0e-2;
 static constexpr double ARGMAX_MARGIN_UNSAFE_THRESHOLD = 1.0e-3;
 
@@ -159,6 +151,13 @@ struct SessionState {
   SessionMode mode = SessionMode::STREAMING;
   int64_t total_audio_samples = 0;
   int64_t synthetic_prefix_samples = 0;
+  // Language-ID prompt conditioning (prompted profile only): device-resident
+  // [1, NUM_PROMPTS] one-hot applied to every encoder output before decode.
+  // Persists across finalize forks and cold resets.
+  torch::Tensor prompt;
+  int64_t prompt_index = -1;
+  std::string language;       // resolved locale for this session ("auto", "es-ES", ...)
+  std::string last_language;  // last complete <xx-XX> tag observed in the hypothesis
 
   SessionState() = default;
 
@@ -188,6 +187,10 @@ struct SessionState {
     mode = other.mode;
     total_audio_samples = other.total_audio_samples;
     synthetic_prefix_samples = other.synthetic_prefix_samples;
+    prompt = other.prompt;
+    prompt_index = other.prompt_index;
+    language = other.language;
+    last_language = other.last_language;
     return *this;
   }
 
@@ -217,6 +220,10 @@ struct SessionState {
     mode = other.mode;
     total_audio_samples = other.total_audio_samples;
     synthetic_prefix_samples = other.synthetic_prefix_samples;
+    prompt = std::move(other.prompt);
+    prompt_index = other.prompt_index;
+    language = std::move(other.language);
+    last_language = std::move(other.last_language);
     return *this;
   }
 };
@@ -842,6 +849,156 @@ void verify_tokenizer_selftest(torch::jit::Module& bundle, const Tokenizer& toke
               tokenizer.pieces.size(), sequences.size());
 }
 
+// ---- language-ID prompt conditioning (prompted profile only) ----------------
+//
+// The multilingual model applies a language prompt to the ENCODER OUTPUT: a
+// [B, NUM_PROMPTS] one-hot is concatenated per-frame with enc_out and passed
+// through a small MLP (prompt_apply.ts, exported from model.prompt_kernel).
+// The cache-aware encoder graphs themselves are language-independent, so the
+// only runtime change is conditioning enc_out before every RNNT decode.
+// Sessions without an explicit language fall back to the bundle's default
+// prompt (target_lang "auto"), matching the Python server's default.
+
+struct PromptTable {
+  std::unordered_map<std::string, int64_t> lang_to_index;
+  int64_t num_prompts = 0;
+  int64_t default_index = -1;
+};
+
+namespace {
+struct PromptRuntime {
+  std::unique_ptr<torch::jit::Module> module;
+  torch::Tensor default_onehot;  // [1, NUM_PROMPTS] on device
+  PromptTable table;
+  std::mutex mu;  // guards initialization only; forward() is called lock-free
+                  // (TorchScript inference is thread-safe, and init completes
+                  // before serving threads start).
+};
+
+PromptRuntime& prompt_runtime() {
+  static PromptRuntime runtime;
+  return runtime;
+}
+}  // namespace
+
+torch::Tensor make_prompt_onehot(int64_t index, torch::Device device) {
+  if (index < 0 || index >= NUM_PROMPTS) {
+    throw std::runtime_error("prompt index out of range: " + std::to_string(index));
+  }
+  auto onehot = torch::zeros({1, NUM_PROMPTS}, torch::dtype(torch::kFloat32).device(device));
+  onehot.index_put_({0, index}, 1.0f);
+  return onehot;
+}
+
+PromptTable prompt_table_from_bundle(torch::jit::Module& bundle) {
+  PromptTable table;
+  if (!bundle.hasattr("prompt_meta")) return table;  // pre-v2 bundle (en profile)
+  auto meta = tensor_to_vec(attr_tensor(bundle, "prompt_meta"));
+  if (meta.size() != 2) throw std::runtime_error("prompt_meta must have 2 entries");
+  table.num_prompts = meta[0];
+  table.default_index = meta[1];
+  auto langs = unpack_utf8_strings(
+      attr_tensor(bundle, "prompt_lang_bytes"),
+      attr_tensor(bundle, "prompt_lang_offsets"),
+      "prompt_lang",
+      -1);
+  auto indices = tensor_to_vec(attr_tensor(bundle, "prompt_lang_indices"));
+  if (langs.size() != indices.size()) {
+    throw std::runtime_error("prompt language/index table size mismatch");
+  }
+  for (size_t i = 0; i < langs.size(); ++i) {
+    if (indices[i] < 0 || (table.num_prompts > 0 && indices[i] >= table.num_prompts)) {
+      throw std::runtime_error("prompt index out of range for language " + langs[i]);
+    }
+    table.lang_to_index[langs[i]] = indices[i];
+  }
+  return table;
+}
+
+void initialize_prompt_runtime(const std::string& artifact_dir,
+                               torch::jit::Module& bundle,
+                               torch::Device device) {
+  if (!MODEL_PROMPTED) return;
+  auto& runtime = prompt_runtime();
+  std::lock_guard<std::mutex> lock(runtime.mu);
+  if (runtime.module != nullptr) return;  // already initialized
+  std::string path = (fs::path(artifact_dir) / "prompt_apply.ts").string();
+  if (!file_exists(path)) {
+    throw std::runtime_error("prompted profile requires prompt_apply.ts in " + artifact_dir);
+  }
+  auto module = load_jit_serialized(path);
+  module.to(device);
+  module.eval();
+  runtime.table = prompt_table_from_bundle(bundle);
+  if (runtime.table.num_prompts != NUM_PROMPTS) {
+    throw std::runtime_error("bundle prompt_meta num_prompts=" +
+                             std::to_string(runtime.table.num_prompts) +
+                             " does not match compiled NUM_PROMPTS=" + std::to_string(NUM_PROMPTS));
+  }
+  if (runtime.table.default_index < 0) {
+    throw std::runtime_error("bundle prompt table has no default prompt index");
+  }
+  runtime.default_onehot = make_prompt_onehot(runtime.table.default_index, device);
+  runtime.module = std::make_unique<torch::jit::Module>(std::move(module));
+  std::printf("prompt runtime initialized: languages=%zu num_prompts=%lld default_index=%lld\n",
+              runtime.table.lang_to_index.size(),
+              static_cast<long long>(runtime.table.num_prompts),
+              static_cast<long long>(runtime.table.default_index));
+}
+
+bool prompt_runtime_initialized() {
+  if (!MODEL_PROMPTED) return true;
+  return prompt_runtime().module != nullptr;
+}
+
+const PromptTable& prompt_runtime_table() {
+  return prompt_runtime().table;
+}
+
+torch::Tensor condition_encoder_output(const torch::Tensor& enc_out, const SessionState& state) {
+  if (!MODEL_PROMPTED) return enc_out;
+  auto& runtime = prompt_runtime();
+  torch::jit::Module* module = runtime.module.get();
+  if (module == nullptr) {
+    throw std::runtime_error("prompted profile decode before initialize_prompt_runtime");
+  }
+  const torch::Tensor& onehot = state.prompt.defined() ? state.prompt : runtime.default_onehot;
+  return module->forward({enc_out, onehot}).toTensor();
+}
+
+// ---- language-tag handling (prompted profile only) --------------------------
+//
+// The multilingual model emits <xx-XX> tags after terminal punctuation (in
+// every target_lang mode). Token ids keep the tags (parity with the Python
+// oracle's y_sequence); the WIRE layer strips them from text and surfaces the
+// last complete tag as the event's language, mirroring
+// server.py::_strip_lang_tags / LANG_TAG_CAPTURE_RE.
+
+std::string strip_lang_tags_text(const std::string& text) {
+  if (!MODEL_PROMPTED) return text;
+  static const std::regex complete_tag(R"(\s*<[a-z]{2}-[A-Z]{2}>)");
+  static const std::regex partial_tag_suffix(R"(\s*<[a-z]{0,2}(-[A-Z]{0,2})?$)");
+  static const std::regex whitespace_run(R"(\s+)");
+  std::string stripped = std::regex_replace(text, complete_tag, " ");
+  stripped = std::regex_replace(stripped, partial_tag_suffix, "");
+  stripped = std::regex_replace(stripped, whitespace_run, " ");
+  size_t first = stripped.find_first_not_of(' ');
+  if (first == std::string::npos) return "";
+  size_t last = stripped.find_last_not_of(' ');
+  return stripped.substr(first, last - first + 1);
+}
+
+std::string last_lang_tag(const std::string& text) {
+  if (!MODEL_PROMPTED) return "";
+  static const std::regex capture_tag(R"(<([a-z]{2}(-[A-Z]{2})?)>)");
+  std::string last;
+  auto begin = std::sregex_iterator(text.begin(), text.end(), capture_tag);
+  for (auto it = begin; it != std::sregex_iterator(); ++it) {
+    last = (*it)[1].str();
+  }
+  return last;
+}
+
 std::vector<EmittedEvent> gold_events_from_bundle(torch::jit::Module& bundle,
                                                         const std::string& prefix,
                                                         const std::string& label) {
@@ -1124,6 +1281,10 @@ SessionState clone_session(const SessionState& state) {
   out.mode = state.mode;
   out.total_audio_samples = state.total_audio_samples;
   out.synthetic_prefix_samples = state.synthetic_prefix_samples;
+  out.prompt = state.prompt;  // shared read-only one-hot; forks keep the parent's language
+  out.prompt_index = state.prompt_index;
+  out.language = state.language;
+  out.last_language = state.last_language;
   return out;
 }
 
@@ -1864,6 +2025,7 @@ static void apply_encoder_outputs(SessionState& state,
                                   bool recurrent_cache_output = false) {
   if (out.size() < 5) throw std::runtime_error("encoder returned fewer than 5 outputs");
   int64_t enc_len = scalar_i64(out[1]);
+  auto conditioned_enc = condition_encoder_output(out[0], state);
   state.clc = out[2].clone();
   state.clt = out[3].clone();
   state.clcl = out[4].clone();
@@ -1877,7 +2039,7 @@ static void apply_encoder_outputs(SessionState& state,
       throw std::runtime_error("AOTI recurrent cache output still aliases after clone-on-assign");
     }
   }
-  decode_range(joint, predict, out[0], enc_len, state.g, state.h, state.c, state.hyp,
+  decode_range(joint, predict, conditioned_enc, enc_len, state.g, state.h, state.c, state.hyp,
                margin_stats, margin_label, secondary_margin_stats);
 }
 
@@ -3835,7 +3997,8 @@ static FinalizeOutcome run_finalize(SessionState& parent,
       fork.clt = out[3];
       fork.clcl = out[4];
     }
-    decode_range(joint, predict, out[0], enc_len, fork.g, fork.h, fork.c, fork.hyp,
+    decode_range(joint, predict, condition_encoder_output(out[0], fork), enc_len,
+                 fork.g, fork.h, fork.c, fork.hyp,
                  margin_stats, label + ".final");
   }
 
@@ -4057,7 +4220,7 @@ static FinalizeOutcome run_finalize_runtime_on_stream(
       snapshot.fork.clt = out[3];
       snapshot.fork.clcl = out[4];
     }
-    decode_range(ctx.joint, ctx.predict, out[0], enc_len,
+    decode_range(ctx.joint, ctx.predict, condition_encoder_output(out[0], snapshot.fork), enc_len,
                  snapshot.fork.g, snapshot.fork.h, snapshot.fork.c, snapshot.fork.hyp,
                  margin_stats, label + ".final");
   }
@@ -4131,7 +4294,7 @@ static FinalizeOutcome run_finalize_runtime(
       snapshot.fork.clt = out[3];
       snapshot.fork.clcl = out[4];
     }
-    decode_range(joint, predict, out[0], enc_len,
+    decode_range(joint, predict, condition_encoder_output(out[0], snapshot.fork), enc_len,
                  snapshot.fork.g, snapshot.fork.h, snapshot.fork.c, snapshot.fork.hyp,
                  margin_stats, label + ".final");
   }
@@ -5322,6 +5485,7 @@ int session_main_entrypoint(int argc, char** argv) {
     verify_session_bundle_meta(bundle, multiturn);
     auto tokenizer = tokenizer_from_bundle(bundle);
     verify_tokenizer_selftest(bundle, tokenizer);
+    initialize_prompt_runtime(dir, bundle, torch::Device(torch::kCUDA, 0));
     bool synthetic_ok = run_synthetic_word_delta_tests();
     int64_t rows = multiturn ? 0 : scalar_i64(attr_tensor(bundle, "num_utts"));
     AudioGeometry audio_geometry;

@@ -12,9 +12,11 @@ Run: ./.venv/bin/python ref_decode.py
 from __future__ import annotations
 import glob, os, torch
 import nemo.collections.asr as nemo_asr
+from model_profile import get_profile, load_profile_model
 
-BLANK = 1024
-MAX_SYMBOLS = 10
+PROFILE = get_profile()
+BLANK = PROFILE.blank
+MAX_SYMBOLS = PROFILE.max_symbols
 
 @torch.inference_mode()
 def ref_greedy_range(decoder, joint, f, t0, t1, state, g):
@@ -58,10 +60,9 @@ def ref_greedy_streamed(decoder, joint, enc, enc_len, n_chunks=2):
     return out
 
 def main():
-    model = nemo_asr.models.ASRModel.from_pretrained(
-        "nvidia/nemotron-speech-streaming-en-0.6b", map_location="cpu").cuda().eval()
+    model = load_profile_model(PROFILE)
     decoder, joint = model.decoder, model.joint
-    fixtures = sorted(glob.glob(os.path.join(os.path.dirname(__file__), "fixtures", "decode_*.pt")))
+    fixtures = sorted(glob.glob(os.path.join(os.path.dirname(__file__), PROFILE.fixtures_dirname, "decode_*.pt")))
     n_pass = n_total = 0
     for fp in fixtures:
         d = torch.load(fp, weights_only=False)

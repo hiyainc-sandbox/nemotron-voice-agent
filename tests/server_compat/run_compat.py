@@ -71,6 +71,7 @@ FINALIZE_TIMING_KEYS = (
     "preproc_ms",
     "scheduler_enqueue_wait_ms",
     "scheduler_future_wait_ms",
+    "scheduler_completion_wait_ms",
     "decode_ms",
     "gil_attrib_enabled",
 )
@@ -80,6 +81,7 @@ OPTIONAL_FINALIZE_TIMING_KEYS = {
     "preproc_ms",
     "scheduler_enqueue_wait_ms",
     "scheduler_future_wait_ms",
+    "scheduler_completion_wait_ms",  # native-only steady-scheduler telemetry
     "decode_ms",
 }
 TIMING_NUMERIC_REQUIRED = {
@@ -97,6 +99,7 @@ TIMING_NUMERIC_NULLABLE = {
     "preproc_ms",
     "scheduler_enqueue_wait_ms",
     "scheduler_future_wait_ms",
+    "scheduler_completion_wait_ms",
     "decode_ms",
 }
 VOLATILE_TOP_LEVEL_KEYS = {
@@ -126,6 +129,9 @@ class Fixture:
     sample_id: str
     pcm: bytes
     audio_samples: int
+    # Prompted (multilingual) model: per-connection ?language= query value
+    # ("" = no query param, server default).
+    language: str = ""
 
 
 @dataclasses.dataclass
@@ -144,6 +150,8 @@ class TranscriptEvent:
         }
         if "finalize" in self.raw:
             sig["finalize"] = self.raw.get("finalize")
+        if "language" in self.raw:
+            sig["language"] = self.raw.get("language")
         return sig
 
 
@@ -290,6 +298,10 @@ async def ws_connect(url: str, timeout_s: float) -> WsConnection:
             max_size=10 * 1024 * 1024,
             open_timeout=timeout_s,
             close_timeout=5.0,
+            # Cold-start warmup (AOTI bucket loads) can stall the server event
+            # loop past the default 20s keepalive; rely on final_timeout_s for
+            # liveness instead of protocol pings.
+            ping_interval=None,
         )
         return WebsocketsConnection(ws)
     if aiohttp is None:
@@ -354,7 +366,7 @@ def _float_audio_to_pcm16(audio: np.ndarray) -> bytes:
     return values.tobytes()
 
 
-def load_fixtures(bundle_path: Path, start: int, n: int) -> list[Fixture]:
+def load_fixtures(bundle_path: Path, start: int, n: int, language: str = "") -> list[Fixture]:
     if not bundle_path.exists():
         raise FileNotFoundError(f"bundle not found: {bundle_path}")
     bundle = torch.jit.load(str(bundle_path), map_location="cpu")
@@ -373,6 +385,7 @@ def load_fixtures(bundle_path: Path, start: int, n: int) -> list[Fixture]:
                 sample_id=_one_utf8(bundle, prefix, "sample_id"),
                 pcm=_float_audio_to_pcm16(audio),
                 audio_samples=int(audio.reshape(-1).shape[0]),
+                language=language,
             )
         )
     return fixtures
@@ -492,6 +505,8 @@ async def capture_utterance(
     start_gate: asyncio.Event | None = None,
 ) -> CaptureResult:
     started = time.perf_counter()
+    if fixture.language:
+        url = f"{url}{'&' if '?' in url else '?'}language={fixture.language}"
     conn = await ws_connect(url, timeout_s=final_timeout_s)
     events: list[TranscriptEvent] = []
     raw_messages: list[dict[str, Any]] = []
@@ -590,7 +605,24 @@ def compare_capture(py: CaptureResult, cpp: CaptureResult) -> list[str]:
             f"utt{utt}: event count mismatch python={len(py.events)} cpp={len(cpp.events)}"
         )
     for index, (py_event, cpp_event) in enumerate(zip(py.events, cpp.events)):
-        if py_event.signature != cpp_event.signature:
+        py_sig = dict(py_event.signature)
+        cpp_sig = dict(cpp_event.signature)
+        # In target_lang=auto the servers may disagree on whether the trailing
+        # <xx-XX> tag token landed inside the finalize decode window: one side
+        # reports the detected locale, the other falls back to "auto". Treat
+        # detected-vs-auto-fallback as compatible; genuine locale mismatches
+        # (e.g. en-US vs es-ES) still fail.
+        py_lang = py_sig.get("language")
+        cpp_lang = cpp_sig.get("language")
+        if (
+            isinstance(py_lang, str)
+            and isinstance(cpp_lang, str)
+            and py_lang != cpp_lang
+            and "auto" in (py_lang, cpp_lang)
+        ):
+            py_sig.pop("language", None)
+            cpp_sig.pop("language", None)
+        if py_sig != cpp_sig:
             failures.append(
                 "utt{utt}: event {index} signature mismatch\n"
                 "  python={py_sig}\n"
@@ -1123,7 +1155,7 @@ async def _run(args: argparse.Namespace) -> int:
     assert_port_free(args.host, args.python_port)
     assert_port_free(args.host, args.cpp_port)
 
-    fixtures = load_fixtures(args.bundle, args.start, args.n)
+    fixtures = load_fixtures(args.bundle, args.start, args.n, language=args.language)
     if len(fixtures) != args.n:
         raise CompatFailure(f"requested {args.n} fixture rows, got {len(fixtures)}")
 
@@ -1263,6 +1295,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--python-port", type=int, default=8080)
     parser.add_argument("--cpp-port", type=int, default=8081)
+    parser.add_argument(
+        "--language",
+        default="",
+        help="prompted (multilingual) model: ?language= value for every fixture connection",
+    )
     parser.add_argument("--python", type=Path, default=PYTHON_EXE)
     parser.add_argument("--cpp-server", type=Path, default=CPP_SERVER)
     parser.add_argument("--density-main", type=Path, default=DENSITY_MAIN)

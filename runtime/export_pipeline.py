@@ -10,16 +10,15 @@ from __future__ import annotations
 import argparse, io, os, numpy as np, torch, soundfile as sf
 from omegaconf import OmegaConf
 import nemo.collections.asr as nemo_asr
+from model_profile import apply_prompt, get_profile, load_profile_model
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--out", default="./artifacts"); a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    m = nemo_asr.models.ASRModel.from_pretrained(
-        "nvidia/nemotron-speech-streaming-en-0.6b", map_location="cpu").cuda().eval()
-    try: m.preprocessor.featurizer.dither = 0.0
-    except Exception: pass
+    profile = get_profile()
+    m = load_profile_model(profile)
     m.change_decoding_strategy(decoding_cfg=OmegaConf.create(
-        {"strategy":"greedy_batch","greedy":{"max_symbols":10,"loop_labels":True,"use_cuda_graph_decoder":False}}))
+        {"strategy":"greedy_batch","greedy":{"max_symbols":profile.max_symbols,"loop_labels":True,"use_cuda_graph_decoder":False}}))
     dev = next(m.parameters()).device
 
     # real clip
@@ -36,6 +35,7 @@ def main():
     with torch.inference_mode():
         proc, proc_len = m.preprocessor(input_signal=audio, length=length)
         enc, enc_len = m.encoder(audio_signal=proc, length=proc_len)
+        enc = apply_prompt(m, enc)
         hyps = m.decoding.rnnt_decoder_predictions_tensor(enc, enc_len, return_hypotheses=True)
     gold = hyps[0].y_sequence; gold = gold if torch.is_tensor(gold) else torch.tensor(gold)
     print(f"gold: {len(gold)} tokens, text={hyps[0].text!r}, enc{list(enc.shape)}")

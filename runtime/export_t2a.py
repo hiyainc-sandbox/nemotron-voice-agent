@@ -10,13 +10,11 @@ from __future__ import annotations
 import argparse, io, os, numpy as np, torch, soundfile as sf
 from omegaconf import OmegaConf
 import nemo.collections.asr as nemo_asr
+from model_profile import get_profile, load_profile_model
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--out",default="./artifacts"); a=ap.parse_args(); os.makedirs(a.out,exist_ok=True)
-    m=nemo_asr.models.ASRModel.from_pretrained("nvidia/nemotron-speech-streaming-en-0.6b",map_location="cpu").cuda().eval()
-    try: m.preprocessor.featurizer.dither=0.0
-    except Exception: pass
-    m.encoder.set_default_att_context_size([70,1])
+    m=load_profile_model(get_profile())
     e=m.encoder; sc=e.streaming_cfg; _int=lambda v:int(v[1]) if isinstance(v,(list,tuple)) else int(v)
     shift,pre,drop=_int(sc.shift_size),_int(sc.pre_encode_cache_size),int(sc.drop_extra_pre_encoded); dev=next(m.parameters()).device
 

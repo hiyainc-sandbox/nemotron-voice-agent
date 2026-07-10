@@ -10,16 +10,14 @@ from __future__ import annotations
 import io, numpy as np, torch, soundfile as sf
 from omegaconf import OmegaConf
 import nemo.collections.asr as nemo_asr
+from model_profile import apply_prompt, get_profile, load_profile_model
 from ref_decode import ref_greedy_range  # reuse the verified resumable decode
 
 def main():
-    m = nemo_asr.models.ASRModel.from_pretrained(
-        "nvidia/nemotron-speech-streaming-en-0.6b", map_location="cpu").cuda().eval()
-    try: m.preprocessor.featurizer.dither = 0.0
-    except Exception: pass
-    m.encoder.set_default_att_context_size([70, 1])
+    profile = get_profile()
+    m = load_profile_model(profile)
     m.change_decoding_strategy(decoding_cfg=OmegaConf.create(
-        {"strategy":"greedy_batch","greedy":{"max_symbols":10,"loop_labels":True,"use_cuda_graph_decoder":False}}))
+        {"strategy":"greedy_batch","greedy":{"max_symbols":profile.max_symbols,"loop_labels":True,"use_cuda_graph_decoder":False}}))
     e, dec, joint = m.encoder, m.decoder, m.joint
     sc = e.streaming_cfg
     _int = lambda v: int(v[1]) if isinstance(v,(list,tuple)) else int(v)
@@ -61,6 +59,7 @@ def main():
                 cache_last_channel=clc, cache_last_time=clt, cache_last_channel_len=clcl,
                 keep_all_outputs=False, drop_extra_pre_encoded=d)
             To = int(enc_len_out[0])
+            enc_out = apply_prompt(m, enc_out)
             # MY decode (state-carry) over this chunk's encoder frames
             f = enc_out.transpose(1, 2).contiguous()
             toks, my_state, g = ref_greedy_range(dec, joint, f, 0, To, my_state, g)

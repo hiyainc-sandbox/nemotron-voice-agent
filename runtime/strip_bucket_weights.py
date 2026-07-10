@@ -31,10 +31,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-BLANK = 1024
-MAX_SYMBOLS = 10
+from model_profile import get_profile
+
+_PROFILE = get_profile()
+BLANK = _PROFILE.blank
+MAX_SYMBOLS = _PROFILE.max_symbols
 BUCKET_RE = re.compile(r"^enc_finalize_d(?P<drop>\d+)_T(?P<T>\d+)\.pt2$")
-DEFAULT_BUCKET = "artifacts/finalize_buckets/enc_finalize_d2_T44.pt2"
+DEFAULT_BUCKET = f"artifacts/finalize_buckets/enc_finalize_d{_PROFILE.drop}_T{_PROFILE.drop2_T[1]}.pt2"
 
 
 @dataclass
@@ -260,7 +263,25 @@ class PackageValidator:
         self.examples: dict[tuple[int, int], ValidationExample] = {}
         self.joint = torch.jit.load(self.joint_path).to(self.device).eval()
         self.predict = torch.jit.load(self.predict_path).to(self.device).eval()
+        # Prompted (multilingual) profile: gold tokens were produced from
+        # prompt-conditioned encoder outputs; condition bucket outputs the same
+        # way (default target language) before decoding.
+        self.prompt_apply = None
+        self.prompt_onehot = None
+        if _PROFILE.prompted:
+            prompt_path = os.path.join(os.path.dirname(self.joint_path), "prompt_apply.ts")
+            if not os.path.exists(prompt_path):
+                raise FileNotFoundError(f"prompted profile requires {prompt_path}")
+            self.prompt_apply = torch.jit.load(prompt_path).to(self.device).eval()
+            onehot = torch.zeros(1, _PROFILE.num_prompts, device=self.device)
+            onehot[0, _PROFILE.default_prompt_index] = 1.0
+            self.prompt_onehot = onehot
         self._load_fixture_examples()
+
+    def _condition(self, enc_out: Any) -> Any:
+        if self.prompt_apply is None:
+            return enc_out
+        return self.prompt_apply(enc_out, self.prompt_onehot)
 
     def _load_fixture_examples(self) -> None:
         torch = self.torch
@@ -338,7 +359,7 @@ class PackageValidator:
             torch,
             self.joint,
             self.predict,
-            out[0],
+            self._condition(out[0]),
             enc_len,
             example.g.to(self.device).contiguous(),
             example.h.to(self.device).contiguous(),

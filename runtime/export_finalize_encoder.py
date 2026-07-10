@@ -31,6 +31,9 @@ from finalize_ref import (
     load_model,
     load_wav,
 )
+from model_profile import get_profile
+
+PROFILE = get_profile()
 
 
 class FinalizeStep(torch.nn.Module):
@@ -224,11 +227,13 @@ def _row_inputs_cuda(row: dict[str, Any], device):
 
 
 # The finalize AOTI bucket grid: both drop regimes reduce to the same window of
-# remaining_frames (34..49). drop=0 => T == remaining_frames; drop=2 =>
-# T == pre_encode_cache_size + remaining_frames. See ARTIFACTS.md ("32 finalize buckets").
-DROP0_T = range(34, 50)  # 16 buckets, T == remaining_frames
-DROP2_T = range(43, 59)  # 16 buckets, T == pre_encode_cache_size + remaining_frames
-TARGETS: set[tuple[int, int]] = {(0, t) for t in DROP0_T} | {(2, t) for t in DROP2_T}
+# remaining_frames. drop=0 => T == remaining_frames; drop=2 =>
+# T == pre_encode_cache_size + remaining_frames. The window starts at
+# final_padding_frames + 2 and is shift_frames wide (34..49 / 43..58 for the en
+# profile). See ARTIFACTS.md ("finalize buckets").
+DROP0_T = PROFILE.drop0_T  # shift buckets, T == remaining_frames
+DROP2_T = PROFILE.drop2_T  # shift buckets, T == pre_encode_cache_size + remaining_frames
+TARGETS: set[tuple[int, int]] = {(0, t) for t in DROP0_T} | {(PROFILE.drop, t) for t in DROP2_T}
 
 
 def _sweep_rows(rt: ContinuousFinalizeRef, ds) -> list[dict[str, Any]]:
@@ -290,8 +295,8 @@ def main() -> int:
 
     fixture_path = os.path.join(args.out, "finalize_fixture.pt")
     meta = {
-        "model": "nvidia/nemotron-speech-streaming-en-0.6b",
-        "att_context_size": [70, 1],
+        "model": PROFILE.model_id,
+        "att_context_size": list(PROFILE.att_context),
         "keep_all_outputs": True,
         "geometry": asdict(rt.geometry),
         "notes": (

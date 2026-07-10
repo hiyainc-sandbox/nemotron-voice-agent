@@ -8,13 +8,11 @@ Run: ./.venv/bin/python validate_preproc.py
 """
 from __future__ import annotations
 import torch, nemo.collections.asr as nemo_asr
+from model_profile import get_profile, load_profile_model
 
 def main():
-    m = nemo_asr.models.ASRModel.from_pretrained(
-        "nvidia/nemotron-speech-streaming-en-0.6b", map_location="cpu").cuda().eval()
+    m = load_profile_model(get_profile())
     pp = m.preprocessor
-    try: pp.featurizer.dither = 0.0
-    except Exception: pass
     try: print("dither:", pp.featurizer.dither, "n_mels:", m.cfg.preprocessor.features)
     except Exception: pass
     dev = next(m.parameters()).device

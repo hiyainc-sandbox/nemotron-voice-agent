@@ -10,16 +10,15 @@ from __future__ import annotations
 import argparse, io, os, numpy as np, torch, soundfile as sf
 from omegaconf import OmegaConf
 import nemo.collections.asr as nemo_asr
+from model_profile import apply_prompt, get_profile, load_profile_model
 from ref_decode import ref_greedy_range
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--out", default="./artifacts"); a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    m = nemo_asr.models.ASRModel.from_pretrained("nvidia/nemotron-speech-streaming-en-0.6b", map_location="cpu").cuda().eval()
-    try: m.preprocessor.featurizer.dither = 0.0
-    except Exception: pass
-    m.encoder.set_default_att_context_size([70, 1])
-    m.change_decoding_strategy(decoding_cfg=OmegaConf.create({"strategy":"greedy_batch","greedy":{"max_symbols":10,"loop_labels":True,"use_cuda_graph_decoder":False}}))
+    profile = get_profile()
+    m = load_profile_model(profile)
+    m.change_decoding_strategy(decoding_cfg=OmegaConf.create({"strategy":"greedy_batch","greedy":{"max_symbols":profile.max_symbols,"loop_labels":True,"use_cuda_graph_decoder":False}}))
     e, dec, joint = m.encoder, m.decoder, m.joint
     sc = e.streaming_cfg; _int=lambda v:int(v[1]) if isinstance(v,(list,tuple)) else int(v)
     shift, pre, drop = _int(sc.shift_size), _int(sc.pre_encode_cache_size), int(sc.drop_extra_pre_encoded)
@@ -69,7 +68,7 @@ def main():
                     L=torch.full((1,),chunk.shape[-1],device=dev,dtype=torch.long); out=mod(chunk,L,clc,clt,clcl)
                 else: out=estep(chunk,clc,clt,clcl,d)
                 eo,elen,clc,clt,clcl=out; encs.append(eo.clone())
-                f=eo.transpose(1,2).contiguous(); t,st,g=ref_greedy_range(dec,joint,f,0,int(elen[0]),st,g); toks+=t
+                f=apply_prompt(m,eo).transpose(1,2).contiguous(); t,st,g=ref_greedy_range(dec,joint,f,0,int(elen[0]),st,g); toks+=t
                 ring=(torch.cat((ring,nm),dim=-1) if ring is not None else nm)[:,:,-pre:]; emitted+=nm.shape[-1]; pos+=shift
         return toks, encs
     eager_tok, eager_enc = run(False)
@@ -91,7 +90,7 @@ def main():
                 s.register_buffer("mel",mel.cpu()); s.register_buffer("gold",torch.tensor(eager_tok,dtype=torch.int64))
                 s.register_buffer("clc0",cache[0].cpu()); s.register_buffer("clt0",cache[1].cpu()); s.register_buffer("clcl0",cache[2].cpu())
                 # metadata the C++ runtime asserts vs its compiled constants (Codex#4: don't hard-code + silently mismatch)
-                s.register_buffer("meta", torch.tensor([shift, pre, drop, 1024, 10], dtype=torch.int64))  # shift,pre,drop,blank,max_symbols
+                s.register_buffer("meta", torch.tensor([shift, pre, drop, profile.blank, profile.max_symbols], dtype=torch.int64))  # shift,pre,drop,blank,max_symbols
             def forward(s): return s.mel
         torch.jit.script(B()).save(os.path.join(a.out,"stream_bundle.ts"))
         print(f"exported enc_first.ts + enc_steady.ts + stream_bundle.ts (mel {Tm}, {len(eager_tok)} gold tok)")

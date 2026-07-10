@@ -6,6 +6,24 @@ from the **public** HuggingFace checkpoint. No private buckets or credentials ar
 
 > Input checkpoint (public, no token): **`nvidia/nemotron-speech-streaming-en-0.6b`**
 
+## Model profiles (en / ml)
+
+Every export script derives its model id, attention context, chunk geometry, and decode constants
+from [`model_profile.py`](model_profile.py), selected by `NEMOTRON_EXPORT_PROFILE`:
+
+- `en` (default) — `nvidia/nemotron-speech-streaming-en-0.6b`, att `[70,1]` (160 ms), vocab 1024.
+  Preserves the original pipeline byte-for-byte.
+- `ml` — `nvidia/nemotron-3.5-asr-streaming-0.6b` (multilingual, 40 locales), att `[56,3]` (320 ms),
+  vocab 13087, SHIFT=32, 64 finalize buckets (drop0 T=130..161, drop2 T=139..170). Language-ID
+  conditioning is a **post-encoder MLP** exported as `prompt_apply.ts` (see `export_decode.py`);
+  the encoder graphs are language-independent. The `ml` model needs **NeMo main / ≥ 26.06**
+  (`EncDecRNNTBPEModelWithPrompt`) in the export venv, and per-profile fixtures live in
+  `fixtures_ml/`. Export into a separate artifact dir (e.g. `--out ./artifacts_ml`).
+
+The C++ side mirrors this in `cpp/lib/session/model_constants.h`, selected at CMake configure time
+with `-DNEMOTRON_PROFILE=ml` (one model per binary). Artifact/binary mismatches fail closed via the
+manifest CONTRACT and session-bundle meta checks.
+
 ## The two stages
 
 Artifact generation is two stages, and the split is what makes cross-GPU deployment work:

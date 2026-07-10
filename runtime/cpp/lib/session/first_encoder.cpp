@@ -56,9 +56,13 @@ void validate_first_encoder_outputs(const std::vector<at::Tensor>& out, const ch
                                " returned undefined output " + std::to_string(i));
     }
   }
-  if (out[0].dim() != 3 || out[0].size(2) != 2) {
+  // Valid first-chunk output frames = SHIFT / subsampling(8): 2 for the en
+  // profile, 4 for ml. The export slices enc_out to exactly this length.
+  constexpr int64_t kFirstChunkValidOut = SHIFT / 8;
+  if (out[0].dim() != 3 || out[0].size(2) != kFirstChunkValidOut) {
     std::ostringstream oss;
-    oss << "first_encoder " << kind << " enc_out is not the sliced [:, :, :2] shape; sizes=";
+    oss << "first_encoder " << kind << " enc_out is not the sliced [:, :, :" << kFirstChunkValidOut
+        << "] shape; sizes=";
     for (auto s : out[0].sizes()) oss << ' ' << s;
     throw std::runtime_error(oss.str());
   }

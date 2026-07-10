@@ -21,7 +21,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-MODEL_ID = "nvidia/nemotron-speech-streaming-en-0.6b"
+from model_profile import get_profile
+
+MODEL_ID = get_profile().model_id
 BUCKET_RE = re.compile(r"^enc_finalize_d(?P<drop>\d+)_T(?P<T>\d+)\.pt2$")
 
 
