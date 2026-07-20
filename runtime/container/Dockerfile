@@ -16,4 +16,9 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libc
 # Pinned torch (cu128) — matches the export producer (T2a byte-exact rule). soundfile for audio fixtures.
 RUN pip install --break-system-packages --no-cache-dir torch==2.8.0 numpy soundfile
 
+# awscli so export_model.sh's S3 source mode works in-container (enter.sh passes AWS creds through).
+# This image is also the pinned glibc-2.39 build env for AOTI serve artifacts: the serve fleet
+# floor is ubuntu 24.04 = glibc 2.39, and export_model.sh's SERVE_GLIBC_MAX gate matches it.
+RUN pip install --break-system-packages --no-cache-dir awscli
+
 WORKDIR /work/runtime

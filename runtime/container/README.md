@@ -38,7 +38,19 @@ Smoke (`docker run --rm --gpus all nemotron-aoti:cu128 ...`):
 ```bash
 ./enter.sh                 # uses nemotron-aoti:cu128 if built, else the base CUDA image; --gpus all; cwd=runtime/
 ./enter.sh python3 ref_decode.py     # run a script directly (note: nemo is NOT in the image — host-export the .pt2/.ts first)
+./enter.sh bash -lc 'PROFILE=ml ./export_model.sh'   # canonical stage-2 serve-artifact export (see below)
 ```
+
+## Pinned glibc build env for serve artifacts (`export_model.sh`)
+The AOTI `.so` inside every compiled `.pt2` links the **build** box's glibc, which becomes the
+*minimum* glibc of every serve host (glibc is backward- but not forward-compatible; below it,
+`dlopen` fails with `GLIBC_x.y not found`). The serve fleet floor is **Ubuntu 24.04 = glibc
+2.39** — exactly this image's glibc — so this container is the canonical place to run
+`export_model.sh` from any host whose glibc is newer (e.g. the 25.04 / glibc-2.41 host).
+`export_model.sh` gates this fail-closed (`SERVE_GLIBC_MAX=2.39`, pre-compile host check +
+post-compile scan of the stamped version-needs); see `README.export_model.md` → "glibc / serve
+compatibility". The image ships `awscli`, and `enter.sh` passes `AWS_*` env vars and mounts
+`~/.aws` read-only so the S3 source mode works in-container.
 The image has **torch + nvcc + AOTInductor**, NOT nemo (model export/fixtures are produced on the host with nemo;
 the container consumes the exported `.pt2`/`.ts` for AOTI compilation + kernel builds).
 

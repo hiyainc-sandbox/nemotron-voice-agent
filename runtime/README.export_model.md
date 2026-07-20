@@ -74,6 +74,9 @@ PROFILE=ml FORCE_S3_DOWNLOAD=1 ./export_model.sh
 - **Disk:** the ml source download is ~172 GiB (en is roughly half — 32 buckets instead of 64);
   compile outputs and the Inductor cache add ~30 GiB. Budget **≥ 250 GiB free** for ml.
 - Root/sudo for the one-time OS deps and `libcuda.so` symlinks (see Script flow).
+- **glibc ≤ 2.39 (Ubuntu ≤ 24.04) on the build box** — see
+  [glibc / serve compatibility](#glibc--serve-compatibility). On a newer host, run the whole
+  export inside the pinned container: `./container/enter.sh bash -lc 'PROFILE=ml ./export_model.sh'`.
 
 The script itself installs the rest: build tools via apt, a `torch==2.8.0` venv (reused across
 runs), and the CUDA link fixes.
@@ -105,6 +108,8 @@ Advanced (defaults preserve `run_l40s_density.sh` behavior):
 | `SKIP_EPS_VERIFY` | `0` | skip the SHA256 sweep against `eps_manifest.json` |
 | `STRICT_EPS_MANIFEST` / `ALLOW_UNMANIFESTED_AUX` | `1` / `1` | manifest strictness for auxiliary (non-compile-input) files |
 | `KEEP_UNSTRIPPED_BUCKETS` | `0` | keep the pre-strip finalize bucket packages in `finalize_buckets/` |
+| `SERVE_GLIBC_MAX` | `2.39` | serve-fleet glibc floor (Ubuntu 24.04); both glibc gates check against it |
+| `ALLOW_INCOMPATIBLE_GLIBC` | `0` | `1` = bypass the glibc gates (artifacts may not load on the serve fleet) |
 | `DENSITY_N_VALUES` etc. | see script | density-sweep knobs, unchanged from `run_l40s_density.sh` |
 
 ## Source artifacts (what gets downloaded)
@@ -199,6 +204,34 @@ The script is safe to re-run after an interruption:
   autotune off) — a clean rebuild is `rm -rf $ART_DIR/stripped_finalize_buckets`;
 - `enc_first_aoti.pt2` is self-checked and kept if present;
 - `enc_steady_aoti.pt2` is always recompiled (single package, cheap relative to the buckets).
+
+## glibc / serve compatibility
+
+The AOTI compile embeds a natively linked `.so` inside every produced `.pt2`. The linker stamps
+the versioned glibc symbols it references (e.g. `__isoc23_strtol@GLIBC_2.38` when built on
+glibc ≥ 2.38), and glibc is **backward- but not forward-compatible** — so the build box's glibc
+silently becomes the *minimum* glibc of every serve host. Below it, `ws_server` fails at load
+with `dlopen: ... version 'GLIBC_2.38' not found`.
+
+**The serve fleet floor is glibc 2.39 = Ubuntu 24.04** (decision 2026-07-20: serving uses the
+Ubuntu-24.04-based `nemotron-ws-server` image; the older 22.04-based `pytorch/pytorch` runtime
+image is retired). Newer serve OSes (26.04, …) are always fine; older ones are not.
+
+The script enforces this fail-closed, at two points:
+
+1. **Preflight** — if the build host's glibc (from `ldd --version`) exceeds `SERVE_GLIBC_MAX`
+   (default `2.39`), it dies before compiling anything and points at the pinned container:
+   `./container/enter.sh bash -lc 'PROFILE=ml ./export_model.sh'`
+   (Ubuntu 24.04 / glibc 2.39 / CUDA 12.8 / torch 2.8.0 / awscli; `enter.sh` passes AWS
+   credentials and `~/.aws` through for the S3 source mode).
+2. **Post-compile** — after each compile stage it unzips the `.so` members of the produced
+   `.pt2` packages and verifies the max stamped `GLIBC_x.y` version-need is ≤ `SERVE_GLIBC_MAX`
+   (`readelf -V` over the extracted members). This certifies the property that actually matters
+   at `dlopen` time, independent of what host the compile ran on.
+
+`ALLOW_INCOMPATIBLE_GLIBC=1` bypasses both gates (e.g. artifacts intentionally targeting a
+newer private fleet). Lower `SERVE_GLIBC_MAX` if an older serve OS ever rejoins the fleet —
+e.g. `SERVE_GLIBC_MAX=2.35` for Ubuntu 22.04-based serve images.
 
 ## Notes & troubleshooting
 

@@ -88,6 +88,13 @@ KEEP_UNSTRIPPED_BUCKETS=${KEEP_UNSTRIPPED_BUCKETS:-0}
 STRICT_EPS_MANIFEST=${STRICT_EPS_MANIFEST:-1}
 ALLOW_UNMANIFESTED_AUX=${ALLOW_UNMANIFESTED_AUX:-1}
 SKIP_EPS_VERIFY=${SKIP_EPS_VERIFY:-0}
+# The AOTI .so inside each compiled .pt2 links the BUILD box's glibc, and glibc symbol
+# versioning is backward- but not forward-compatible: the build glibc becomes the minimum
+# glibc of every serve host (dlopen fails with "GLIBC_x.y not found" below it). The serve
+# fleet floor is ubuntu 24.04 = glibc 2.39 (decision 2026-07-20); build at or below it —
+# on a newer host, build inside the pinned container (runtime/container/enter.sh).
+SERVE_GLIBC_MAX=${SERVE_GLIBC_MAX:-2.39}
+ALLOW_INCOMPATIBLE_GLIBC=${ALLOW_INCOMPATIBLE_GLIBC:-0}  # 1 = skip both glibc gates
 
 # Arch-agnostic auxiliary artifacts downloaded alongside the compile inputs. They are
 # not compile inputs but complete the serve set backup_artifacts_s3.sh uploads.
@@ -131,6 +138,83 @@ sudo_cmd() {
   else
     die "need root or sudo for: $*"
   fi
+}
+
+check_build_glibc() {
+  local host_glibc
+  host_glibc=$(ldd --version 2>/dev/null | awk 'NR==1{print $NF}')
+  [[ "$host_glibc" =~ ^[0-9]+\.[0-9]+$ ]] || die "cannot parse host glibc version from ldd --version"
+  if [[ "$(printf '%s\n' "$SERVE_GLIBC_MAX" "$host_glibc" | sort -V | tail -1)" != "$SERVE_GLIBC_MAX" ]]; then
+    if [[ "$ALLOW_INCOMPATIBLE_GLIBC" == "1" ]]; then
+      log "WARNING: host glibc $host_glibc > SERVE_GLIBC_MAX=$SERVE_GLIBC_MAX and ALLOW_INCOMPATIBLE_GLIBC=1 — artifacts built here will NOT load on serve hosts with glibc < $host_glibc"
+      return 0
+    fi
+    die "host glibc $host_glibc > SERVE_GLIBC_MAX=$SERVE_GLIBC_MAX: AOTI .so files built here would fail dlopen on the serve fleet (GLIBC_x.y not found). Build inside the pinned container (runtime/container/enter.sh) or set ALLOW_INCOMPATIBLE_GLIBC=1 to override."
+  fi
+  log "host glibc $host_glibc <= serve floor $SERVE_GLIBC_MAX — OK"
+}
+
+# Fail-closed check of what actually matters at serve time: the max GLIBC_x.y version-need
+# stamped into the .so members of each produced .pt2 package must not exceed SERVE_GLIBC_MAX.
+verify_artifact_glibc() {
+  if [[ "$ALLOW_INCOMPATIBLE_GLIBC" == "1" ]]; then
+    log "ALLOW_INCOMPATIBLE_GLIBC=1; skipping stamped-GLIBC verification of $# package(s)"
+    return 0
+  fi
+  log "verifying stamped GLIBC floor <= $SERVE_GLIBC_MAX in $# package(s)"
+  "$PY" - "$SERVE_GLIBC_MAX" "$@" <<'PY'
+import re
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+limit = tuple(int(x) for x in sys.argv[1].split("."))
+pkgs = [Path(p) for p in sys.argv[2:]]
+ver_re = re.compile(r"\bGLIBC_(\d+)\.(\d+)\b")
+failures = []
+checked_sos = 0
+worst = (0, 0)
+
+for pkg in pkgs:
+    if not pkg.is_file():
+        failures.append(f"missing package: {pkg}")
+        continue
+    with zipfile.ZipFile(pkg) as zf:
+        so_members = [m for m in zf.namelist() if m.endswith(".so") or ".so." in Path(m).name]
+        if not so_members:
+            failures.append(f"{pkg}: no .so members found (unexpected for an AOTI package)")
+            continue
+        with tempfile.TemporaryDirectory(prefix="glibc_scan_", dir=pkg.parent) as tmp:
+            for member in so_members:
+                so_path = Path(zf.extract(member, tmp))
+                out = subprocess.run(
+                    ["readelf", "-V", str(so_path)],
+                    check=True, capture_output=True, text=True,
+                ).stdout
+                vers = {(int(a), int(b)) for a, b in ver_re.findall(out)}
+                checked_sos += 1
+                if not vers:
+                    continue
+                top = max(vers)
+                worst = max(worst, top)
+                if top > limit:
+                    failures.append(
+                        f"{pkg}:{member} requires GLIBC_{top[0]}.{top[1]} > serve floor "
+                        f"GLIBC_{sys.argv[1]} — would fail dlopen on the serve fleet"
+                    )
+
+if failures:
+    print("stamped-GLIBC verification FAILED:", file=sys.stderr)
+    for failure in failures:
+        print("  " + failure, file=sys.stderr)
+    raise SystemExit(2)
+print(
+    f"stamped-GLIBC verification OK: packages={len(pkgs)} sos={checked_sos} "
+    f"max_stamped=GLIBC_{worst[0]}.{worst[1]} floor=GLIBC_{sys.argv[1]}"
+)
+PY
 }
 
 install_os_deps() {
@@ -629,6 +713,7 @@ compile_steady() {
   log "native $TARGET_SM AOTI compile, autotune OFF: enc_steady_t2a.pt2 -> enc_steady_aoti.pt2"
   NEMOTRON_ART_DIR="$ART_DIR" "$PY" "$ROOT/aot_compile.py"
   need_file "$ART_DIR/enc_steady_aoti.pt2"
+  verify_artifact_glibc "$ART_DIR/enc_steady_aoti.pt2"
 }
 
 compile_enc_first() {
@@ -642,6 +727,7 @@ compile_enc_first() {
     --artifacts "$ART_DIR" \
     --self-check-atol "$SELF_CHECK_ATOL"
   need_file "$ART_DIR/enc_first_aoti.pt2"
+  verify_artifact_glibc "$ART_DIR/enc_first_aoti.pt2"
 }
 
 compile_steady_batched() {
@@ -674,10 +760,13 @@ compile_steady_batched() {
     --production-b1 "$ART_DIR/enc_steady_aoti.pt2"
 
   local b
+  local -a batch_pkgs=()
   while IFS= read -r b; do
     need_file "$STEADY_B_DIR/enc_steady_aoti_b${b}.pt2"
+    batch_pkgs+=("$STEADY_B_DIR/enc_steady_aoti_b${b}.pt2")
   done < <(steady_batch_values)
   need_file "$STEADY_B_DIR/MANIFEST.json"
+  verify_artifact_glibc "${batch_pkgs[@]}"
 }
 
 compile_strip_bucket() {
@@ -739,6 +828,12 @@ compile_finalize_buckets() {
   for ep in "${eps[@]}"; do
     compile_strip_bucket "$ep"
   done
+
+  local -a stripped_pkgs=()
+  while IFS= read -r path; do
+    stripped_pkgs+=("$path")
+  done < <(find "$ART_DIR/stripped_finalize_buckets" -maxdepth 1 -type f -name 'enc_finalize_d*_T*.pt2' | sort)
+  verify_artifact_glibc "${stripped_pkgs[@]}"
 
   "$PY" - "$ART_DIR" "$ROOT" "$EXPECTED_BUCKETS" "$TARGET_TAG" <<'PY'
 import datetime as dt
@@ -1123,6 +1218,7 @@ main() {
   log "model=$MODEL_ID buckets=$EXPECTED_BUCKETS art_dir=$ART_DIR"
   nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader || true
 
+  check_build_glibc
   install_os_deps
   prepare_cuda_link_env
   setup_venv
