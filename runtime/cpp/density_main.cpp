@@ -146,7 +146,8 @@ struct DensityArgs {
   bool steady_overlap_probe = true;
   int density_rows = -1;
   int density_sessions_per_worker = 0;
-  double density_chunk_period_ms = 160.0;
+  // Real-time cadence: one steady chunk per SHIFT 10ms mel frames (en 160, ml 320).
+  double density_chunk_period_ms = SHIFT * 10.0;
   double density_start_stagger_ms = 0.0;  // spread per-worker first-session starts over [0,this]; 0 = barrier (synchronized)
   bool density_warmup = true;
   int b1_batch_size = 3;
@@ -161,6 +162,7 @@ struct DensityArgs {
   bool batch_disable_min_fill = false;
   int steady_dispatch_lanes = 0;
   int admission_active_cap = -1;
+  bool admission_active_cap_defaulted = false;
   int admission_backlog_cap = -1;
 };
 
@@ -507,6 +509,8 @@ static DensityArgs parse_density_args(int argc, char** argv) {
     throw std::runtime_error("--steady-dispatch-lanes must be 1 or 2");
   }
   if (args.admission_active_cap < 0) {
+    const char* cap_env = std::getenv("NEMOTRON_DENSITY_ADMISSION_ACTIVE_CAP");
+    args.admission_active_cap_defaulted = (cap_env == nullptr || cap_env[0] == '\0');
     args.admission_active_cap =
         read_density_env_int("NEMOTRON_DENSITY_ADMISSION_ACTIVE_CAP", 40);
   }
@@ -951,14 +955,32 @@ static void merge_scheduler_telemetry(BatchedSteadySchedulerTelemetry& dst,
   }
 }
 
+// Log root: NEMOTRON_DENSITY_LOG_DIR overrides the default <artifacts>/logs.
+// The artifacts dir may be a read-only mount (docker -v ...:ro); telemetry is
+// also emitted on stdout, so fall back to a tmp dir instead of failing setup.
+static std::string density_logs_dir(const std::string& artifacts_dir, const std::string& stamp) {
+  const char* env = std::getenv("NEMOTRON_DENSITY_LOG_DIR");
+  fs::path root = (env != nullptr && env[0] != '\0') ? fs::path(env) : fs::path(artifacts_dir) / "logs";
+  fs::path dir = root / stamp;
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  if (!ec) return dir.string();
+  fs::path fallback = fs::temp_directory_path() / "nemotron_density_logs" / stamp;
+  fs::create_directories(fallback);
+  std::fprintf(stderr,
+               "density logs dir %s not writable (%s); falling back to %s "
+               "(set NEMOTRON_DENSITY_LOG_DIR to choose)\n",
+               dir.string().c_str(), ec.message().c_str(), fallback.string().c_str());
+  return fallback.string();
+}
+
 static void emit_telemetry(const std::string& dir,
                            const std::string& stamp,
                            int num_runners,
                            const std::string& stream_mode,
                            const std::string& topology,
                            const std::string& json) {
-  std::string logs_dir = dir + "/logs/" + stamp;
-  fs::create_directories(logs_dir);
+  std::string logs_dir = density_logs_dir(dir, stamp);
   std::string path = logs_dir + "/density_num_runners" + std::to_string(num_runners) +
                      "_stream-" + sanitize_filename(stream_mode) +
                      "_topology-" + sanitize_filename(topology) + ".jsonl";
@@ -1712,7 +1734,10 @@ static double apply_encoder_outputs_density(SessionState& state,
   state.clc = out[2].clone();
   state.clt = out[3].clone();
   state.clcl = out[4].clone();
-  decode_range_density(joint, predict, out[0], enc_len, state.g, state.h, state.c, state.hyp, &item_wait_ms);
+  // ml profile: the language-prompt MLP must condition the encoder output before
+  // decode (no-op for en), matching the session runtime path.
+  decode_range_density(joint, predict, condition_encoder_output(out[0], state), enc_len,
+                       state.g, state.h, state.c, state.hyp, &item_wait_ms);
   return item_wait_ms;
 }
 
@@ -2306,7 +2331,7 @@ static FinalizeOutcome run_finalize_density(SessionState& parent,
     auto decode_start = Clock::now();
     decode_range_density(joint,
                          predict,
-                         out[0],
+                         condition_encoder_output(out[0], fork),
                          enc_len,
                          fork.g,
                          fork.h,
@@ -6338,6 +6363,14 @@ static DensitySweepRunResult run_density_sweep_one_impl(const DensityArgs& args,
     result.requested_sessions = args.density_rows;
   } else {
     result.requested_sessions = rows_total;
+    // Measuring N concurrent streams needs >=1 session per worker; the bundle
+    // may have fewer utterances than N (utts repeat i % rows_total).
+    if (result.requested_sessions < n) {
+      std::printf("=== DENSITY 1a SESSION FLOOR: bumped requested sessions from %d to %d "
+                  "so all %d workers carry a stream (bundle has %d utterances, reused round-robin) ===\n",
+                  result.requested_sessions, n, n, rows_total);
+      result.requested_sessions = n;
+    }
   }
   if (result.requested_sessions <= 0) throw std::runtime_error("density sweep requested zero sessions");
   auto& assignment_bundle = *shared_bundle;
@@ -6357,6 +6390,14 @@ static DensitySweepRunResult run_density_sweep_one_impl(const DensityArgs& args,
     throw std::runtime_error("density sweep serial reference is smaller than the assigned utterance set");
   }
   auto assigned = assign_density_utts(result.workers, rows_total, result.requested_sessions);
+  for (size_t w = 0; w < assigned.size(); ++w) {
+    if (assigned[w].empty()) {
+      throw std::runtime_error("density sweep under-provisioned: worker" + std::to_string(w) +
+                               " has no assigned session (sessions=" +
+                               std::to_string(result.requested_sessions) + " < N=" + std::to_string(n) +
+                               "); raise --density-sessions-per-worker or --density-rows");
+    }
+  }
   auto bucket_reps = representative_finalize_cases_for_assignments(assignment_bundle, assigned);
   auto needed_buckets = finalize_keys_from_representatives(bucket_reps);
   auto worker_bucket_reps = representative_finalize_cases_by_worker(assignment_bundle, assigned);
@@ -6493,7 +6534,17 @@ static DensitySweepRunResult run_density_sweep_one_impl(const DensityArgs& args,
   result.stream_uniqueness_ok = !result.explicit_stream || result.unique_streams == result.workers;
   log_density_phase_timing(n, "worker-context-creation", worker_context_start);
   auto tokenizer = tokenizer_from_bundle(contexts[0]->bundle);
-  DensityAdmission admission(static_cast<uint64_t>(args.admission_active_cap),
+  // A defaulted admission cap below N sheds workers and fails the sweep's
+  // correctness gate; the sweep exists to measure N concurrent streams. An
+  // explicit --admission-active-cap / env value is honored as a shedding test.
+  int admission_active_cap = args.admission_active_cap;
+  if (args.admission_active_cap_defaulted && admission_active_cap < n) {
+    std::printf("=== DENSITY 1a ADMISSION FLOOR: raised default admission active cap %d -> %d to admit "
+                "all N workers (set --admission-active-cap or NEMOTRON_DENSITY_ADMISSION_ACTIVE_CAP to pin) ===\n",
+                admission_active_cap, n);
+    admission_active_cap = n;
+  }
+  DensityAdmission admission(static_cast<uint64_t>(admission_active_cap),
                              static_cast<uint64_t>(args.admission_backlog_cap));
   StaleGenTelemetry stale_gen;
 
@@ -7071,8 +7122,7 @@ static void emit_density_sweep_manifest(const DensityArgs& args,
                                         const std::string& stamp,
                                         const DensitySweepSummary& summary,
                                         int rows_total) {
-  std::string logs_dir = args.dir + "/logs/" + stamp;
-  fs::create_directories(logs_dir);
+  std::string logs_dir = density_logs_dir(args.dir, stamp);
   std::string path = logs_dir + "/density_sweep_manifest.json";
   std::ofstream out(path, std::ios::out | std::ios::trunc);
   if (!out) throw std::runtime_error("failed to open density sweep manifest: " + path);
@@ -7260,8 +7310,7 @@ static void emit_run_manifest(const DensityArgs& args,
                               const std::string& correctness_status,
                               const std::string& steady_status,
                               const std::string& finalize_status) {
-  std::string logs_dir = args.dir + "/logs/" + stamp;
-  fs::create_directories(logs_dir);
+  std::string logs_dir = density_logs_dir(args.dir, stamp);
   std::string path = logs_dir + "/manifest.json";
   std::ofstream out(path, std::ios::out | std::ios::trunc);
   if (!out) throw std::runtime_error("failed to open manifest: " + path);
@@ -10562,6 +10611,13 @@ int main(int argc, char** argv) {
                   args.density_warmup ? "true" : "false",
                   kMinFinalizeP95Samples,
                   std::getenv("CUDA_MODULE_LOADING") ? std::getenv("CUDA_MODULE_LOADING") : "(unset)");
+      if (args.n_values.size() > 1) {
+        std::printf("=== DENSITY 1a WARNING: %zu N values in ONE process — per-row teardown does not return "
+                    "all GPU memory (~8-10 GiB retained per row: per-N worker contexts, enc_first copies, "
+                    "loaders), so later rows can hit CUDA OOM at high N. The supported sweep mode is a fresh "
+                    "process per N (what run_l40s_density.sh / export_model.sh do) ===\n",
+                    args.n_values.size());
+      }
       auto summary = run_density_sweep(args, device, stamp, shared_bundle, rows_total);
       return summary.pass_to_1b ? 0 : 1;
     }

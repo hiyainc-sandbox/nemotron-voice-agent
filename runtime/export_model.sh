@@ -43,10 +43,12 @@ PROFILE=${PROFILE:-en}
 case "$PROFILE" in
   en)
     MODEL_ID="nvidia/nemotron-speech-streaming-en-0.6b"
+    PROFILE_SHIFT=16                   # steady-chunk shift in 10ms mel frames (model_profile.py)
     EXPECTED_BUCKETS=32                # 2 * shift(16): drop0 + drop2 finalize buckets
     ;;
   ml)
     MODEL_ID="nvidia/nemotron-3.5-asr-streaming-0.6b"
+    PROFILE_SHIFT=32
     EXPECTED_BUCKETS=64                # 2 * shift(32)
     ;;
   *)
@@ -81,7 +83,9 @@ COMPILE_STEADY_BATCH=${COMPILE_STEADY_BATCH:-1}  # 1 = also AOTI-compile + strip
 RUN_DENSITY=${RUN_DENSITY:-0}                    # 1 = build density_main and run the sweep after compiling
 DENSITY_N_VALUES=${DENSITY_N_VALUES:-"1,8,16,24,32,40,48,64,80"}
 DENSITY_SESSIONS_PER_WORKER=${DENSITY_SESSIONS_PER_WORKER:-0}
-DENSITY_CHUNK_PERIOD_MS=${DENSITY_CHUNK_PERIOD_MS:-160}
+# Real-time pacing = one steady chunk per shift*10ms of audio (en 160, ml 320). A fixed
+# 160 would drive ml streams at 2x real-time and halve the measured knee.
+DENSITY_CHUNK_PERIOD_MS=${DENSITY_CHUNK_PERIOD_MS:-$((PROFILE_SHIFT * 10))}
 DENSITY_TREAT_NO_PASS_AS_FAILURE=${DENSITY_TREAT_NO_PASS_AS_FAILURE:-0}
 FORCE_S3_DOWNLOAD=${FORCE_S3_DOWNLOAD:-0}
 KEEP_UNSTRIPPED_BUCKETS=${KEEP_UNSTRIPPED_BUCKETS:-0}
